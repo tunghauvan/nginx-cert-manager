@@ -209,6 +209,92 @@ class Route53Manager:
             logger.error(f"Failed to get DNS records: {e}")
             raise
 
+    def create_dns_validation_record(self, domain, validation_name, validation_value):
+        """
+        Create a DNS record for certificate validation.
+        
+        Args:
+            domain: Domain being validated
+            validation_name: DNS name for the validation record
+            validation_value: Value for the validation record
+            
+        Returns:
+            Boolean indicating success or failure
+        """
+        zone_id = self.get_hosted_zone_id(domain)
+        if not zone_id:
+            return False
+        
+        try:
+            # Create the validation record
+            self.client.change_resource_record_sets(
+                HostedZoneId=zone_id,
+                ChangeBatch={
+                    'Changes': [
+                        {
+                            'Action': 'UPSERT',
+                            'ResourceRecordSet': {
+                                'Name': validation_name,
+                                'Type': 'TXT',
+                                'TTL': 300,
+                                'ResourceRecords': [
+                                    {
+                                        'Value': f'"{validation_value}"'
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error creating DNS record: {e}")
+            return False
+    
+    def delete_dns_validation_record(self, domain, validation_name, validation_value):
+        """
+        Delete a DNS validation record.
+        
+        Args:
+            domain: Domain being validated
+            validation_name: DNS name for the validation record
+            validation_value: Value for the validation record
+            
+        Returns:
+            Boolean indicating success or failure
+        """
+        zone_id = self.get_hosted_zone_id(domain)
+        if not zone_id:
+            return False
+        
+        try:
+            # Delete the validation record
+            self.client.change_resource_record_sets(
+                HostedZoneId=zone_id,
+                ChangeBatch={
+                    'Changes': [
+                        {
+                            'Action': 'DELETE',
+                            'ResourceRecordSet': {
+                                'Name': validation_name,
+                                'Type': 'TXT',
+                                'TTL': 300,
+                                'ResourceRecords': [
+                                    {
+                                        'Value': f'"{validation_value}"'
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting DNS record: {e}")
+            return False
+
 # Example usage
 if __name__ == "__main__":
     # Configure logging
