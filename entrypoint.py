@@ -109,14 +109,30 @@ def issue_certificate(args, config):
             aws_secret_key=args.aws_secret_key or config.get("aws_secret_key"),
             aws_region=args.aws_region or config.get("aws_region")
         )
+
+        # Getting root domain from the domain
+        root_domain = args.domain.split(".")[-2] + "." + args.domain.split(".")[-1]
+        logger.info(f"Root domain for DNS challenge: {root_domain}")
         
-        # Get zone ID for the domain
-        zone_id = route53.get_hosted_zone_id(args.domain)
+        # Get zone ID for the root domain
+        zone_id = route53.get_hosted_zone_id(root_domain)
         if not zone_id:
-            logger.error(f"No hosted zone found for domain {args.domain}")
+            logger.error(f"No hosted zone found for root domain {root_domain}")
             return False
         
-        logger.info(f"Found hosted zone ID: {zone_id} for domain {args.domain}")
+        logger.info(f"Found hosted zone ID: {zone_id} for root domain {root_domain}")
+        
+        # Send request to RabbitMQ using utility function
+        from utils.rabbitmq import send_rabbitmq_message
+        message = {
+            "action": "issue_certificate",
+            "domain": args.domain,
+            "email": args.email,
+            "zone_id": zone_id
+        }
+        if not send_rabbitmq_message("cert_requests", message):
+            logger.error("Failed to send request to RabbitMQ")
+            return False
         
         # TODO: Implement certificate issuance with Let's Encrypt using DNS challenge
     
