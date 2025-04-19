@@ -1,0 +1,10 @@
+apiVersion: cert.nginx.io/v1
+kind: DomainCertificate
+metadata:
+  name: test-cert-webhook
+  namespace: default
+spec:
+  domain: webhook-test.asean-accesstrade.net
+  email: tunghau.jp@interspace.vn
+  dnsProvider: route53
+  autoRenewal: true

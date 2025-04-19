@@ -4,12 +4,15 @@ import logging
 import pika
 import time
 import threading
+from datetime import datetime
 from dotenv import load_dotenv
 import boto3
 import tempfile
 from utils.sshagent import SSHAgent
 from utils.certbot import request_certificate
 from utils.s3 import upload_cert_to_s3
+from kubernetes import client, config
+from kubernetes.client.rest import ApiException
 
 load_dotenv()
 
@@ -41,6 +44,29 @@ SSH_PORT = int(os.environ.get("SSH_PORT", 22))
 SSH_USER = os.environ.get("SSH_USER", "ubuntu")
 SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/root/.ssh/key.pem")
 S3_CERT_BUCKET = os.environ.get("S3_CERT_BUCKET", "accesstrade-server-configs")
+
+# Kubernetes CRD settings
+CRD_GROUP = "cert.nginx.io"
+CRD_VERSION = "v1"
+CRD_PLURAL = "domaincertificates"
+
+# Initialize Kubernetes client
+k8s_custom_objects_api = None
+try:
+    # Try in-cluster configuration first
+    if os.environ.get("KUBERNETES_SERVICE_HOST"):
+        config.load_incluster_config()
+        logger.info("Using in-cluster Kubernetes configuration")
+    else:
+        # Fall back to local kubeconfig
+        config.load_kube_config()
+        logger.info("Using local Kubernetes configuration")
+        
+    k8s_custom_objects_api = client.CustomObjectsApi()
+    logger.info("Kubernetes client initialized successfully")
+except Exception as e:
+    logger.warning(f"Failed to initialize Kubernetes client: {e}")
+    logger.warning("CRD status updates will be disabled")
 
 def setup_delay_queue(channel, queue_name):
     """
@@ -77,19 +103,90 @@ def setup_delay_queue(channel, queue_name):
     logger.info(f"Configured delay queue: {delay_queue_name} with TTL: {RETRY_DELAY_MS}ms")
     return retry_exchange_name, delay_queue_name
 
+def update_crd_status(namespace, name, status_data):
+    """
+    Update the status of a DomainCertificate CRD
+    
+    Args:
+        namespace: Namespace of the CRD
+        name: Name of the CRD
+        status_data: Dictionary containing status fields to update
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not k8s_custom_objects_api:
+        logger.warning(f"Kubernetes client not initialized, skipping status update for {namespace}/{name}")
+        return False
+        
+    try:
+        # Create the status patch
+        status_patch = {
+            "status": status_data
+        }
+        
+        # Update the CRD status
+        k8s_custom_objects_api.patch_namespaced_custom_object_status(
+            group=CRD_GROUP,
+            version=CRD_VERSION,
+            namespace=namespace,
+            plural=CRD_PLURAL,
+            name=name,
+            body=status_patch
+        )
+        
+        logger.info(f"Updated status for DomainCertificate {namespace}/{name} to {status_data.get('state', 'Unknown')}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update status for DomainCertificate {namespace}/{name}: {e}")
+        return False
+
 def process_cert_request(body, channel=None):
     try:
         data = json.loads(body)
         logger.info(f"Received certificate request: {data}")
+        
+        # Extract basic information
         domain = data.get("domain")
         email = data.get("email")
+        
+        # Extract CRD information for status updates
+        crd_name = data.get("crd_name")
+        crd_namespace = data.get("crd_namespace", "default")
+        
         if not domain or not email:
             logger.error("Missing domain or email in request")
+            if crd_name:
+                update_crd_status(crd_namespace, crd_name, {
+                    "state": "Error",
+                    "message": "Missing domain or email in request",
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "InvalidRequest",
+                        "message": "Missing domain or email in request",
+                        "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                    }]
+                })
             return False
         
         logger.info(f"Processing certificate request for {domain} with email {email}")
-
-        # Request certificate using the utility function
+        
+        # Update CRD status to Processing
+        if crd_name:
+            update_crd_status(crd_namespace, crd_name, {
+                "state": "Processing",
+                "message": "Certificate request is being processed",
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "Processing",
+                    "message": "Certificate request is being processed",
+                    "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                }]
+            })
+        
+        # Request certificate
         if request_certificate(
             domain, 
             email, 
@@ -97,23 +194,93 @@ def process_cert_request(body, channel=None):
             config_dir=CERTBOT_CONFIG_DIR,
             log_dir=CERTBOT_LOG_DIR
         ):
-            # Publish success event to RabbitMQ
+            # Certificate successfully issued
+            logger.info(f"Certificate issued successfully for {domain}")
+            
+            # Get certificate details (in a real implementation, parse from certificate)
+            now = datetime.utcnow()
+            not_before = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+            # Set expiry to 90 days (typical for Let's Encrypt)
+            not_after = datetime(now.year + (1 if now.month <= 9 else 0), 
+                                 ((now.month + 3 - 1) % 12) + 1, 
+                                 min(now.day, 28)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            serial_number = f"mock-{int(time.time())}"  # Real implementation would get actual serial number
+            
+            # Update CRD status to Issued with certificate details
+            if crd_name:
+                update_crd_status(crd_namespace, crd_name, {
+                    "state": "Issued",
+                    "message": "Certificate issued successfully",
+                    "notBefore": not_before,
+                    "notAfter": not_after,
+                    "serialNumber": serial_number,
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "CertificateIssued",
+                        "message": "Certificate successfully issued",
+                        "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                    }]
+                })
+            
+            # Publish success event to RabbitMQ with CRD information
             if channel:
+                # Include CRD information in success event for deployment
                 channel.basic_publish(
                     exchange='',
                     routing_key=QUEUE_NAME_SUCCESS,
-                    body=json.dumps({"domain": domain, "status": "success"}),
+                    body=json.dumps({
+                        "domain": domain, 
+                        "status": "success",
+                        "crd_name": crd_name,
+                        "crd_namespace": crd_namespace
+                    }),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
                 logger.info(f"Published success event for {domain}")
             else:
                 logger.warning("No channel provided, couldn't publish success event")
+
             return True
         else:
+            # Certificate request failed
             logger.error(f"Certificate request failed for {domain}")
+            
+            # Update CRD status to Error
+            if crd_name:
+                update_crd_status(crd_namespace, crd_name, {
+                    "state": "Error",
+                    "message": "Failed to issue certificate",
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "IssueFailed",
+                        "message": "Failed to issue certificate",
+                        "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                    }]
+                })
             return False
     except Exception as e:
         logger.error(f"Failed to process cert request message: {e}")
+        # Update CRD status to Error if we have CRD information
+        try:
+            if 'data' in locals() and isinstance(data, dict):
+                crd_name = data.get("crd_name")
+                crd_namespace = data.get("crd_namespace", "default")
+                if crd_name:
+                    update_crd_status(crd_namespace, crd_name, {
+                        "state": "Error",
+                        "message": f"Error processing certificate request: {str(e)}",
+                        "conditions": [{
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": "ProcessingError",
+                            "message": f"Error processing certificate request: {str(e)}",
+                            "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                        }]
+                    })
+        except Exception as update_error:
+            logger.error(f"Failed to update CRD status after error: {update_error}")
         return False
 
 def process_success_event(body):
@@ -122,12 +289,21 @@ def process_success_event(body):
         data = json.loads(body)
         domain = data.get("domain")
         status = data.get("status")
+        crd_name = data.get("crd_name")
+        crd_namespace = data.get("crd_namespace", "default")
         
         if not domain or status != "success":
             logger.error(f"Invalid success event data: {data}")
             return False
         
         logger.info(f"Processing success event for domain: {domain}")
+        
+        # Update CRD status to Deploying if available
+        if crd_name:
+            update_crd_status(crd_namespace, crd_name, {
+                "state": "Deploying",
+                "message": "Certificate is being deployed to NGINX servers"
+            })
         
         # Initialize SSH connection to deploy certificate
         ssh = SSHAgent()
@@ -205,6 +381,21 @@ def process_success_event(body):
                 logger.info("Nginx reloaded successfully")
             
             logger.info(f"Success event for {domain} processed completely")
+
+            # Update CRD status to Deployed
+            if crd_name:
+                update_crd_status(crd_namespace, crd_name, {
+                    "state": "Deployed",
+                    "message": "Certificate successfully deployed to NGINX servers",
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "CertificateDeployed",
+                        "message": "Certificate successfully deployed to NGINX servers",
+                        "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                    }]
+                })
+            
             return True
                 
         finally:
