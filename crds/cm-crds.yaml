@@ -98,20 +98,23 @@ spec:
                   description: "Last time the certificate was renewed"
                 deployedTo:
                   type: array
-                  description: "List of NGINX servers where the certificate is deployed"
+                  description: "List of NGINX servers where the certificate deployment was attempted"
                   items:
                     type: object
                     properties:
                       server:
                         type: string
-                        description: "NGINX server identifier"
+                        description: "NGINX server identifier (e.g., IP address)"
                       deployTime:
                         type: string
                         format: date-time
-                        description: "Time when certificate was deployed to this server"
+                        description: "Time when deployment attempt was made to this server"
                       status:
                         type: string
                         description: "Deployment status (Success, Failed)"
+                      error:
+                        type: string
+                        description: "Error message if deployment failed"
       additionalPrinterColumns:
       - name: Domain
         type: string

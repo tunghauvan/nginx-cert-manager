@@ -441,21 +441,73 @@ def process_deployment_event(body, channel): # Added channel parameter
             logger.info(f"Success event for {domain} processed completely for instance {instance_ip}")
             deployment_successful = True # Mark deployment as successful
 
-            # Update CRD status to Deployed
-            if crd_name:
-                update_crd_status( # Call imported function
-                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
-                    crd_namespace, crd_name, {
+            # Update CRD status to Deployed, including deployedTo list
+            if crd_name and k8s_custom_objects_api:
+                deployed_to_list = []
+                try:
+                    # Fetch current CR to get existing deployedTo list
+                    current_cr = k8s_custom_objects_api.get_namespaced_custom_object(
+                        group=CRD_GROUP,
+                        version=CRD_VERSION,
+                        namespace=crd_namespace,
+                        plural=CRD_PLURAL,
+                        name=crd_name
+                    )
+                    deployed_to_list = current_cr.get('status', {}).get('deployedTo', [])
+                    if not isinstance(deployed_to_list, list): # Ensure it's a list
+                        logger.warning(f"Existing status.deployedTo for {crd_namespace}/{crd_name} is not a list. Resetting.")
+                        deployed_to_list = []
+
+                except ApiException as e:
+                    logger.warning(f"Failed to fetch current CR status for {crd_namespace}/{crd_name} before updating deployedTo: {e}. Proceeding without existing list.")
+                except Exception as e:
+                    logger.warning(f"Unexpected error fetching current CR status for {crd_namespace}/{crd_name}: {e}. Proceeding without existing list.")
+
+
+                # Create new entry for this deployment
+                deploy_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                new_deployment_entry = {
+                    "server": instance_ip, # Use instance_ip as the server identifier
+                    "deployTime": deploy_time,
+                    "status": "Success"
+                }
+
+                # Optional: Remove previous entries for the same server to keep only the latest
+                deployed_to_list = [entry for entry in deployed_to_list if entry.get('server') != instance_ip]
+                deployed_to_list.append(new_deployment_entry)
+
+                # Prepare the full status update payload
+                status_payload = {
                     "state": "Deployed",
                     "message": f"Certificate successfully deployed to NGINX server at {instance_ip}",
+                    "deployedTo": deployed_to_list, # Include the updated list
                     "conditions": [{
                         "type": "Ready",
                         "status": "True",
                         "reason": "CertificateDeployed",
-                        "message": "Certificate successfully deployed to NGINX servers",
-                        "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                        "message": f"Certificate successfully deployed to {instance_ip}" # More specific message
+                        # lastTransitionTime will be added by update_crd_status
                     }]
-                }, logger)
+                }
+                update_crd_status( # Call imported function
+                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                    crd_namespace, crd_name, status_payload, logger)
+            elif crd_name:
+                 # Fallback if k8s client isn't available but we have crd_name (shouldn't happen often)
+                 logger.warning("Kubernetes client not available, cannot update deployedTo status.")
+                 update_crd_status( # Call imported function with basic status
+                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                    crd_namespace, crd_name, {
+                        "state": "Deployed",
+                        "message": f"Certificate successfully deployed to NGINX server at {instance_ip}",
+                         "conditions": [{
+                            "type": "Ready",
+                            "status": "True",
+                            "reason": "CertificateDeployed",
+                            "message": f"Certificate successfully deployed to {instance_ip}"
+                        }]
+                    }, logger)
+
 
             # Publish to success queue
             channel.basic_publish(
@@ -479,13 +531,37 @@ def process_deployment_event(body, channel): # Added channel parameter
              logger.info(f"Published failed deployment event for {domain} to DLQ due to deployment error on {instance_ip}: {ssh_error}")
              # Update CRD status to Error if possible
              if crd_name:
+                 # Prepare status update payload for error
+                 error_status_payload = {
+                     "state": "Error",
+                     "message": f"Deployment failed on {instance_ip}: {str(ssh_error)}"
+                     # Optionally add/update a 'Deployed' condition with status False
+                 }
+                 # Add deployedTo status for the failure attempt
+                 deployed_to_list = []
+                 try:
+                     current_cr = k8s_custom_objects_api.get_namespaced_custom_object(
+                         group=CRD_GROUP, version=CRD_VERSION, namespace=crd_namespace, plural=CRD_PLURAL, name=crd_name
+                     )
+                     deployed_to_list = current_cr.get('status', {}).get('deployedTo', [])
+                     if not isinstance(deployed_to_list, list): deployed_to_list = []
+                 except Exception: pass # Ignore errors fetching status during error handling
+
+                 deploy_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                 failed_deployment_entry = {
+                     "server": instance_ip,
+                     "deployTime": deploy_time,
+                     "status": "Failed",
+                     "error": str(ssh_error) # Add error message
+                 }
+                 deployed_to_list = [entry for entry in deployed_to_list if entry.get('server') != instance_ip]
+                 deployed_to_list.append(failed_deployment_entry)
+                 error_status_payload["deployedTo"] = deployed_to_list
+
                  update_crd_status( # Call imported function
                      k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
-                     crd_namespace, crd_name, {
-                     "state": "Error",
-                     "message": f"Deployment failed on {instance_ip}: {str(ssh_error)}",
-                     "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                 }, logger)
+                     crd_namespace, crd_name, error_status_payload, logger)
+
              return False # Indicate failure
         finally:
             # Ensure SSH connection is closed
