@@ -1,0 +1,93 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: domaincertificates.cert.nginx.io # Plural name.group
+spec:
+  group: cert.nginx.io
+  names:
+    plural: domaincertificates
+    singular: domaincertificate
+    kind: DomainCertificate
+    shortNames:
+    - domcert # Optional short name for kubectl
+  scope: Namespaced # Or Cluster if it applies to the entire cluster
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              description: "Specification for the DomainCertificate"
+              properties:
+                domain:
+                  type: string
+                  description: "The domain name for which the certificate is requested."
+                  # required: true # Optional: Make this field required
+                email:
+                  type: string
+                  description: "The email address for certificate notifications."
+                  format: email
+                  # required: true # Optional: Make this field required
+                nginxConfigs:
+                  type: array
+                  description: "List of Nginx configurations to update with the certificate."
+                  items:
+                    type: object
+                    description: "Details for a specific Nginx server configuration."
+                    properties:
+                      server:
+                        type: string
+                        description: "The name or identifier of the Nginx server."
+                        # required: true
+                      configPath:
+                        type: string
+                        description: "The path to the Nginx configuration file on the server."
+                        # required: true
+                      certPath:
+                        type: string
+                        description: "The directory path on the server where the certificate files should be stored."
+                        # required: true
+                      vhost:
+                        type: string
+                        description: "The virtual host name in the Nginx configuration."
+                        # required: true
+                      instanceIp:
+                        type: string
+                        description: "The IP address of the Nginx instance."
+                        format: ipv4
+                        # required: true
+                  # Optional: require at least one nginxConfig
+                  # minItems: 1
+                autoRenewal:
+                  type: boolean
+                  description: "Whether to automatically renew the certificate."
+                  default: true # Optional: Set a default value
+                dnsProvider:
+                  type: string
+                  description: "The DNS provider to use for domain validation (e.g., route53, cloudflare)."
+                  # required: true
+            status:
+              type: object
+              description: "Current status of the DomainCertificate"
+              properties:
+                issueDate:
+                  type: string
+                  description: "The date the certificate was issued."
+                  format: date-time
+                expireDate:
+                  type: string
+                  description: "The date the certificate will expire."
+                  format: date-time
+                state:
+                  type: string
+                  description: "The current state of the certificate (e.g., 'pending', 'valid', 'expired', 'error')."
+                  enum:
+                    - pending
+                    - valid
+                    - expired
+                    - error
+                  default: pending # Optional: Set a default state
