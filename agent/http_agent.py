@@ -10,7 +10,7 @@ import json
 import os
 import subprocess
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # Added timezone
 from functools import wraps
 
 import flask
@@ -634,7 +634,7 @@ def handle_crd_event():
                 "status": {
                     "state": "Pending",
                     "message": "Certificate request queued for processing.",
-                    "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ') 
+                    "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') 
                 }
             }
             try:

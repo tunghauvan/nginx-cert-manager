@@ -11,4 +11,5 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY . /app
 
-CMD ["python", "entrypoint.py", "serve"]
+# Use the unified worker as the entrypoint
+CMD ["python", "unified_worker.py"]
