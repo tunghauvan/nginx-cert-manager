@@ -4,7 +4,7 @@ metadata:
   # Name of the Deployment
   name: nginx-cert-manager-agent
   # Namespace where the agent will run
-  namespace: default 
+  namespace: nginx-cert-manager 
   labels:
     # Label for the Deployment itself
     app: nginx-cert-manager-agent
@@ -33,7 +33,8 @@ spec:
           env:
             # Environment variables needed by the agent
             - name: RABBITMQ_HOST
-              value: "rabbitmq.default.svc.cluster.local" # Example using K8s service DNS
+              # Use the Kubernetes Service name for RabbitMQ within the cluster
+              value: "rabbitmq.nginx-cert-manager.svc.cluster.local" 
             - name: RABBITMQ_PORT
               value: "5672"
             - name: AWS_REGION

@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: nginx-cert-manager # Ensure this matches the namespace of your agents/workers
+  labels:
+    app: rabbitmq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3-management # Use the image with the management plugin
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5672
+          name: amqp
+        - containerPort: 15672
+          name: management
+        env:
+        # Load username and password from the existing agent-secrets
+        # Note: RabbitMQ uses RABBITMQ_DEFAULT_USER and RABBITMQ_DEFAULT_PASS
+        - name: RABBITMQ_DEFAULT_USER
+          valueFrom:
+            secretKeyRef:
+              name: agent-secrets # Reuse the secret created for the agent
+              key: rabbitmq_user
+        - name: RABBITMQ_DEFAULT_PASS
+          valueFrom:
+            secretKeyRef:
+              name: agent-secrets # Reuse the secret created for the agent
+              key: rabbitmq_password
+        # Add readiness and liveness probes for better stability
+        readinessProbe:
+          tcpSocket:
+            port: 5672
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["rabbitmq-diagnostics", "status"]
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          timeoutSeconds: 15
+      # Optional: Add persistence using PersistentVolumeClaims if needed
+      # volumes:
+      #   - name: rabbitmq-data
+      #     persistentVolumeClaim:
+      #       claimName: rabbitmq-pvc # Define a PVC separately
+      # volumeMounts:
+      #   - name: rabbitmq-data
+      #     mountPath: /var/lib/rabbitmq

@@ -4,7 +4,7 @@ metadata:
   # Name of the Service - should match the name used in the ValidatingWebhookConfiguration
   name: nginx-cert-manager-agent
   # Namespace where the agent deployment and this service reside
-  namespace: default 
+  namespace: nginx-cert-manager 
   labels:
     # Optional: Labels for the service itself
     app: nginx-cert-manager-agent
