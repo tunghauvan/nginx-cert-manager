@@ -18,7 +18,10 @@ rules:
 - apiGroups: [""] # Core API group
   resources: ["secrets"] # Permission for secrets
   # Limit verbs if possible, e.g., only get/create/update if delete isn't needed
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] 
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""] # Core API group
+  resources: ["namespaces"] # Permission for namespaces
+  verbs: ["get", "list", "watch"] # Permissions needed for listing namespaces
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

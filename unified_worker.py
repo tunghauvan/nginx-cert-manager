@@ -58,6 +58,7 @@ CRD_PLURAL = "domaincertificates"
 
 # Initialize Kubernetes client
 k8s_custom_objects_api = None
+k8s_core_v1_api = None # Added CoreV1Api client
 try:
     # Try in-cluster configuration first
     if os.environ.get("KUBERNETES_SERVICE_HOST"):
@@ -67,12 +68,13 @@ try:
         # Fall back to local kubeconfig
         config.load_kube_config()
         logger.info("Using local Kubernetes configuration")
-        
+
     k8s_custom_objects_api = client.CustomObjectsApi()
-    logger.info("Kubernetes client initialized successfully")
+    k8s_core_v1_api = client.CoreV1Api() # Initialize CoreV1Api
+    logger.info("Kubernetes clients (CustomObjectsApi, CoreV1Api) initialized successfully")
 except Exception as e:
-    logger.warning(f"Failed to initialize Kubernetes client: {e}")
-    logger.warning("CRD status updates will be disabled")
+    logger.warning(f"Failed to initialize Kubernetes clients: {e}")
+    logger.warning("CRD status updates and renewal checks might be disabled or limited.")
 
 def process_cert_request(body, channel=None):
     instance_ip = None # Variable to store instance IP
@@ -669,136 +671,178 @@ def process_deployment_event(body, channel): # Added channel parameter
         return False # Indicate failure
 
 # --- Renewal Check Function ---
-def check_and_trigger_renewals(channel, k8s_api, stop_event):
-    """Lists DomainCertificates, checks expiration, and triggers renewals."""
+def check_and_trigger_renewals(channel, k8s_co_api, k8s_core_api, stop_event): # Added k8s_core_api parameter
+    """Lists DomainCertificates per namespace, checks expiration, and triggers renewals."""
     logger.info("Starting periodic renewal check...")
     while not stop_event.is_set():
         try:
-            if not k8s_api:
-                logger.warning("Kubernetes client not available, skipping renewal check.")
-                # Sleep even if k8s isn't available to avoid a tight loop if it fails temporarily
+            if not k8s_co_api or not k8s_core_api: # Check both clients
+                logger.warning("Kubernetes client(s) not available, skipping renewal check.")
                 stop_event.wait(RENEWAL_CHECK_INTERVAL_SECONDS)
                 continue
 
-            logger.info("Listing DomainCertificates for renewal check...")
-            cr_list = k8s_api.list_cluster_custom_object(
-                group=CRD_GROUP,
-                version=CRD_VERSION,
-                plural=CRD_PLURAL
-            )
-            logger.info(f"Received {len(cr_list.get('items', []))} DomainCertificates for renewal check.")
+            logger.info("Listing namespaces for renewal check...")
+            try:
+                namespaces = k8s_core_api.list_namespace()
+                logger.info(f"Found {len(namespaces.items)} namespaces.")
+            except ApiException as e:
+                logger.error(f"Kubernetes API error listing namespaces: {e.status} - {e.reason}. Check RBAC permissions for listing namespaces.")
+                # Sleep and retry later if listing namespaces fails
+                stop_event.wait(RENEWAL_CHECK_INTERVAL_SECONDS)
+                continue
+            except Exception as e:
+                 logger.error(f"Unexpected error listing namespaces: {e}", exc_info=True)
+                 stop_event.wait(RENEWAL_CHECK_INTERVAL_SECONDS)
+                 continue
+
 
             now = datetime.now(timezone.utc)
             renewal_trigger_time = now + timedelta(days=RENEWAL_THRESHOLD_DAYS)
+            total_crs_processed = 0
 
-            for item in cr_list.get('items', []):
-                metadata = item.get('metadata', {})
-                spec = item.get('spec', {})
-                status = item.get('status', {})
-
-                name = metadata.get('name')
-                namespace = metadata.get('namespace', 'default')
-                domain = spec.get('domain')
-                email = spec.get('email')
-                auto_renewal = spec.get('autoRenewal', False)
-                not_after_str = status.get('notAfter')
-                current_state = status.get('state')
-                logger.info(f"Processing CR {namespace}/{name} for domain {domain} with state '{current_state}'")
-
-                if not name or not domain or not email:
-                    logger.info(f"Skipping CR {namespace}/{name} due to missing name, domain, or email.")
-                    continue
-
-                if not auto_renewal:
-                    logger.info(f"Skipping CR {namespace}/{name} for domain {domain}: autoRenewal is false.")
-                    continue
-
-                if not not_after_str:
-                    logger.info(f"Skipping CR {namespace}/{name} for domain {domain}: status.notAfter is not set.")
-                    continue
-
-                # States that indicate an operation is already in progress
-                if current_state in ["Processing", "Renewing", "Deploying"]:
-                     logger.info(f"Skipping CR {namespace}/{name} for domain {domain}: current state is '{current_state}'.")
-                     continue
+            # Iterate through each namespace
+            for ns in namespaces.items:
+                namespace_name = ns.metadata.name
+                if stop_event.is_set(): # Check stop event frequently
+                    break
+                logger.debug(f"Checking for DomainCertificates in namespace: {namespace_name}")
 
                 try:
-                    # Attempt to parse with different potential formats, including timezone info
-                    not_after_dt = None
-                    formats_to_try = [
-                        '%Y-%m-%dT%H:%M:%SZ',        # ISO 8601 UTC (common)
-                        '%Y-%m-%dT%H:%M:%S.%fZ',     # ISO 8601 UTC with microseconds
-                        '%Y-%m-%d %H:%M:%S %z',      # With timezone offset
-                        '%Y-%m-%d %H:%M:%S',         # Naive datetime (assume UTC)
-                        '%Y-%m-%dT%H:%M:%S%z',       # ISO 8601 with offset
-                    ]
-                    for fmt in formats_to_try:
+                    cr_list = k8s_co_api.list_namespaced_custom_object(
+                        group=CRD_GROUP,
+                        version=CRD_VERSION,
+                        plural=CRD_PLURAL,
+                        namespace=namespace_name
+                    )
+                    num_crs_in_ns = len(cr_list.get('items', []))
+                    if num_crs_in_ns > 0:
+                        logger.info(f"Found {num_crs_in_ns} DomainCertificates in namespace '{namespace_name}'.")
+                    total_crs_processed += num_crs_in_ns
+
+                    for item in cr_list.get('items', []):
+                        if stop_event.is_set(): break # Check stop event frequently
+
+                        metadata = item.get('metadata', {})
+                        spec = item.get('spec', {})
+                        status = item.get('status', {})
+
+                        name = metadata.get('name')
+                        # Namespace is already known (namespace_name)
+                        domain = spec.get('domain')
+                        email = spec.get('email')
+                        auto_renewal = spec.get('autoRenewal', False)
+                        not_after_str = status.get('notAfter')
+                        current_state = status.get('state')
+                        logger.info(f"Processing CR {namespace_name}/{name} for domain {domain} with state '{current_state}'")
+
+                        if not name or not domain or not email:
+                            logger.info(f"Skipping CR {namespace_name}/{name} due to missing name, domain, or email.")
+                            continue
+
+                        if not auto_renewal:
+                            logger.info(f"Skipping CR {namespace_name}/{name} for domain {domain}: autoRenewal is false.")
+                            continue
+
+                        if not not_after_str:
+                            logger.info(f"Skipping CR {namespace_name}/{name} for domain {domain}: status.notAfter is not set.")
+                            continue
+
+                        # States that indicate an operation is already in progress
+                        if current_state in ["Processing", "Renewing", "Deploying"]:
+                             logger.info(f"Skipping CR {namespace_name}/{name} for domain {domain}: current state is '{current_state}'.")
+                             continue
+
                         try:
-                            not_after_dt = datetime.strptime(not_after_str, fmt)
-                            # If parsed datetime is naive, assume UTC
-                            if not_after_dt.tzinfo is None or not_after_dt.tzinfo.utcoffset(not_after_dt) is None:
-                                not_after_dt = not_after_dt.replace(tzinfo=timezone.utc)
-                            break # Stop trying formats once one works
-                        except ValueError:
-                            continue # Try next format
+                            # Attempt to parse with different potential formats, including timezone info
+                            not_after_dt = None
+                            formats_to_try = [
+                                '%Y-%m-%dT%H:%M:%SZ',        # ISO 8601 UTC (common)
+                                '%Y-%m-%dT%H:%M:%S.%fZ',     # ISO 8601 UTC with microseconds
+                                '%Y-%m-%d %H:%M:%S %z',      # With timezone offset
+                                '%Y-%m-%d %H:%M:%S',         # Naive datetime (assume UTC)
+                                '%Y-%m-%dT%H:%M:%S%z',       # ISO 8601 with offset
+                            ]
+                            for fmt in formats_to_try:
+                                try:
+                                    not_after_dt = datetime.strptime(not_after_str, fmt)
+                                    # If parsed datetime is naive, assume UTC
+                                    if not_after_dt.tzinfo is None or not_after_dt.tzinfo.utcoffset(not_after_dt) is None:
+                                        not_after_dt = not_after_dt.replace(tzinfo=timezone.utc)
+                                    break # Stop trying formats once one works
+                                except ValueError:
+                                    continue # Try next format
 
-                    if not_after_dt is None:
-                         raise ValueError(f"Could not parse date string '{not_after_str}' with known formats.")
+                            if not_after_dt is None:
+                                 raise ValueError(f"Could not parse date string '{not_after_str}' with known formats.")
 
-                except ValueError as e:
-                    logger.warning(f"Skipping CR {namespace}/{name} for domain {domain}: Could not parse notAfter date '{not_after_str}': {e}")
-                    continue
+                        except ValueError as e:
+                            logger.warning(f"Skipping CR {namespace_name}/{name} for domain {domain}: Could not parse notAfter date '{not_after_str}': {e}")
+                            continue
 
-                # Check if the expiration date is within the renewal threshold
-                if not_after_dt <= renewal_trigger_time:
-                    logger.info(f"Certificate for domain {domain} ({namespace}/{name}) needs renewal (expires {not_after_str}, threshold {RENEWAL_THRESHOLD_DAYS} days).")
+                        # Check if the expiration date is within the renewal threshold
+                        if not_after_dt <= renewal_trigger_time:
+                            logger.info(f"Certificate for domain {domain} ({namespace_name}/{name}) needs renewal (expires {not_after_str}, threshold {RENEWAL_THRESHOLD_DAYS} days).")
 
-                    # 1. Update CRD status to Renewing
-                    update_crd_status(
-                        k8s_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
-                        namespace, name, {
-                        "state": "Renewing",
-                        "message": f"Automatic renewal triggered (expires {not_after_str})",
-                        "conditions": [{ # Keep existing conditions or replace? Replacing for simplicity here.
-                            "type": "Ready",
-                            "status": "False",
-                            "reason": "Renewing",
-                            "message": f"Automatic renewal triggered (expires {not_after_str})",
-                            "lastTransitionTime": now.strftime('%Y-%m-%dT%H:%M:%SZ')
-                        }]
-                    }, logger)
+                            # 1. Update CRD status to Renewing
+                            update_crd_status(
+                                k8s_co_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                                namespace_name, name, { # Use namespace_name here
+                                "state": "Renewing",
+                                "message": f"Automatic renewal triggered (expires {not_after_str})",
+                                "conditions": [{ # Keep existing conditions or replace? Replacing for simplicity here.
+                                    "type": "Ready",
+                                    "status": "False",
+                                    "reason": "Renewing",
+                                    "message": f"Automatic renewal triggered (expires {not_after_str})",
+                                    "lastTransitionTime": now.strftime('%Y-%m-%dT%H:%M:%SZ')
+                                }]
+                            }, logger)
 
-                    # 2. Publish renewal request to RabbitMQ
-                    renewal_message = {
-                        "domain": domain,
-                        "email": email,
-                        "crd_name": name,
-                        "crd_namespace": namespace,
-                        # "action": "renew" # Optional: Add action if process_cert_request needs it
-                    }
-                    try:
-                        channel.basic_publish(
-                            exchange='',
-                            routing_key=QUEUE_NAME_REQUESTS,
-                            body=json.dumps(renewal_message),
-                            properties=pika.BasicProperties(delivery_mode=2) # Persistent
-                        )
-                        logger.info(f"Published renewal request for {domain} ({namespace}/{name}) to queue '{QUEUE_NAME_REQUESTS}'.")
-                    except Exception as pub_e:
-                        logger.error(f"Failed to publish renewal request for {domain} ({namespace}/{name}): {pub_e}")
-                        # Optionally revert CRD status back from Renewing if publish fails?
-                        # For now, it will be retried on the next check cycle.
+                            # 2. Publish renewal request to RabbitMQ
+                            renewal_message = {
+                                "domain": domain,
+                                "email": email,
+                                "crd_name": name,
+                                "crd_namespace": namespace_name, # Use namespace_name here
+                                # "action": "renew" # Optional: Add action if process_cert_request needs it
+                            }
+                            try:
+                                channel.basic_publish(
+                                    exchange='',
+                                    routing_key=QUEUE_NAME_REQUESTS,
+                                    body=json.dumps(renewal_message),
+                                    properties=pika.BasicProperties(delivery_mode=2) # Persistent
+                                )
+                                logger.info(f"Published renewal request for {domain} ({namespace_name}/{name}) to queue '{QUEUE_NAME_REQUESTS}'.")
+                            except Exception as pub_e:
+                                logger.error(f"Failed to publish renewal request for {domain} ({namespace_name}/{name}): {pub_e}")
+                                # Optionally revert CRD status back from Renewing if publish fails?
+                                # For now, it will be retried on the next check cycle.
 
-                else:
-                    logger.debug(f"Certificate for domain {domain} ({namespace}/{name}) does not need renewal yet (expires {not_after_str}).")
+                        else:
+                            logger.debug(f"Certificate for domain {domain} ({namespace_name}/{name}) does not need renewal yet (expires {not_after_str}).")
+
+                except ApiException as e:
+                    # Log error specific to listing CRs in this namespace and continue
+                    logger.error(f"Kubernetes API error listing DomainCertificates in namespace '{namespace_name}': {e.status} - {e.reason}. Check RBAC permissions for this namespace.")
+                    # Continue to the next namespace
+                except Exception as e:
+                    logger.error(f"Unexpected error processing namespace '{namespace_name}': {e}", exc_info=True)
+                    # Continue to the next namespace
+
+            if stop_event.is_set():
+                 logger.info("Renewal check interrupted.")
+            else:
+                 logger.info(f"Renewal check finished. Processed {total_crs_processed} CRs across {len(namespaces.items)} namespaces.")
 
         except ApiException as e:
+            # This catches errors not specific to a namespace loop (e.g., initial client issues)
             logger.error(f"Kubernetes API error during renewal check: {e.status} - {e.reason} - {e.body}")
         except Exception as e:
             logger.error(f"Unexpected error during renewal check: {e}", exc_info=True) # Log traceback for unexpected errors
 
         # Wait for the specified interval or until stop event is set
-        logger.debug(f"Renewal check finished. Sleeping for {RENEWAL_CHECK_INTERVAL_SECONDS} seconds...")
+        logger.debug(f"Sleeping for {RENEWAL_CHECK_INTERVAL_SECONDS} seconds before next renewal check...")
         stop_event.wait(RENEWAL_CHECK_INTERVAL_SECONDS)
 
     logger.info("Renewal check thread stopped.")
@@ -880,16 +924,17 @@ def main():
     # --- Start Renewal Check Thread ---
     stop_event = threading.Event()
     renewal_thread = None
-    if k8s_custom_objects_api: # Only start if K8s client is available
+    # Check both K8s clients are available
+    if k8s_custom_objects_api and k8s_core_v1_api:
         renewal_thread = threading.Thread(
             target=check_and_trigger_renewals,
-            args=(channel, k8s_custom_objects_api, stop_event),
+            args=(channel, k8s_custom_objects_api, k8s_core_v1_api, stop_event), # Pass both clients
             daemon=True # Allows main thread to exit even if this thread is running
         )
         renewal_thread.start()
         logger.info("Renewal check thread started.")
     else:
-        logger.warning("Kubernetes client not available, automatic renewal checks disabled.")
+        logger.warning("One or both Kubernetes clients not available, automatic renewal checks disabled.")
     # --- End Renewal Check Thread ---
 
     logger.info(f"Unified worker started. Listening for messages on queues '{QUEUE_NAME_REQUESTS}' and '{QUEUE_NAME_DEPLOYMENT}'. To exit press CTRL+C")
@@ -901,12 +946,13 @@ def main():
              # This allows KeyboardInterrupt to be caught more reliably than channel.start_consuming()
              connection.process_data_events(time_limit=1)
              # Optional: Check if renewal thread is alive and restart if needed
-             if renewal_thread and not renewal_thread.is_alive() and k8s_custom_objects_api:
+             # Check both K8s clients are available before restarting
+             if renewal_thread and not renewal_thread.is_alive() and k8s_custom_objects_api and k8s_core_v1_api:
                  logger.warning("Renewal check thread seems to have stopped unexpectedly. Restarting...")
                  stop_event.clear() # Ensure stop event is clear before restarting
                  renewal_thread = threading.Thread(
                      target=check_and_trigger_renewals,
-                     args=(channel, k8s_custom_objects_api, stop_event),
+                     args=(channel, k8s_custom_objects_api, k8s_core_v1_api, stop_event), # Pass both clients
                      daemon=True
                  )
                  renewal_thread.start()
