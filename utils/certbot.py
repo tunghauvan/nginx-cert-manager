@@ -64,7 +64,8 @@ def request_certificate(domain, email,
         else:
             # Decide if S3 upload failure should cause the whole process to fail
             # Currently warning and returning True as cert was obtained and copied
-            logger.warning(f"Failed to upload certificate files for {domain} to S3, but continuing...")
+            logger.error(f"Failed to upload certificate files for {domain} to S3")
+            return False
 
         return True
     except Exception as e:
