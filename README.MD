@@ -18,6 +18,10 @@ A comprehensive tool for automating SSL certificate management for NGINX servers
 git clone https://github.com/tunghauvan/nginx-cert-manager.git
 cd nginx-cert-manager
 
+# Install CRDS
+kubectl apply -f crds
+
+# Install Resources
 kubectl apply -f k8s
 ```
 
