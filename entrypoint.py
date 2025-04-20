@@ -50,6 +50,14 @@ def parse_arguments() -> argparse.Namespace:
     deploy_parser.add_argument("--key-path", "-k", help="Path to SSH private key")
     deploy_parser.add_argument("--password", "-p", help="SSH password (not recommended, use key-based auth)")
     
+    # Create parser for 'serve' command
+    serve_parser = subparsers.add_parser("serve", help="Start the HTTP agent service")
+    serve_parser.add_argument("--host", default="0.0.0.0", help="Host to bind the HTTP server to")
+    serve_parser.add_argument("--port", "-p", type=int, default=5000, help="Port to listen on")
+    serve_parser.add_argument("--debug", action="store_true", help="Run in debug mode")
+    serve_parser.add_argument("--cert", help="Path to SSL certificate for HTTPS")
+    serve_parser.add_argument("--key", help="Path to SSL key for HTTPS")
+    
     # AWS credentials for Route53
     aws_group = parser.add_argument_group("AWS Route53 Configuration")
     aws_group.add_argument("--aws-access-key", help="AWS Access Key ID")
@@ -148,6 +156,42 @@ def deploy_certificate(args, config):
     return True
 
 
+def serve_http_agent(args, config):
+    """
+    Start the HTTP agent service.
+    
+    Args:
+        args: Command line arguments
+        config: Configuration dictionary
+    """
+    try:
+        # Import the HTTP agent module here to avoid circular imports
+        from agent.http_agent import app
+        
+        logger.info(f"Starting HTTP agent on {args.host}:{args.port}")
+        
+        # Configure SSL if certificates are provided
+        ssl_context = None
+        if args.cert and args.key:
+            logger.info("Using SSL with provided certificate and key")
+            ssl_context = (args.cert, args.key)
+        
+        # Start the Flask application
+        app.run(
+            host=args.host,
+            port=args.port,
+            debug=args.debug,
+            ssl_context=ssl_context
+        )
+        return True
+    except ImportError:
+        logger.error("Failed to import HTTP agent module. Make sure agent/http_agent.py exists.")
+        return False
+    except Exception as e:
+        logger.error(f"Error starting HTTP agent: {e}")
+        return False
+
+
 def main():
     """Main entry point for the application."""
     args = parse_arguments()
@@ -174,6 +218,8 @@ def main():
         result = renew_certificates(args, config)
     elif args.command == "deploy":
         result = deploy_certificate(args, config)
+    elif args.command == "serve":
+        result = serve_http_agent(args, config)
     else:
         logger.error("No command specified. Use --help to see available commands.")
         return 1
