@@ -20,7 +20,6 @@ webhooks:
         port: 443                      # Webhooks MUST use HTTPS
       # caBundle: MUST be provided. Base64-encoded CA certificate bundle to verify
       # the webhook server's certificate. cert-manager can inject this automatically.
-      caBundle: Cg==
     admissionReviewVersions: ["v1"]
     sideEffects: None
     timeoutSeconds: 5 # Keep timeout short

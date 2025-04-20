@@ -7,10 +7,10 @@ metadata:
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole # Changed from Role
 metadata:
   name: domaincertificate-editor
-  namespace: nginx-cert-manager # Ensure this matches the deployment namespace
+  # Removed namespace field
 rules:
 - apiGroups: ["cert.nginx.io"] # The API group of your CRD
   resources: ["domaincertificates", "domaincertificates/status"] # The plural name of your CRD and its status subresource
@@ -22,17 +22,17 @@ rules:
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding # Changed from RoleBinding
 metadata:
   name: nginx-cert-manager-agent-rb
-  namespace: nginx-cert-manager # Ensure this matches the deployment namespace
+  # Removed namespace field
 subjects:
 - kind: ServiceAccount
   name: nginx-cert-manager-agent-sa # Name of the ServiceAccount created above
   namespace: nginx-cert-manager # Namespace of the ServiceAccount
 roleRef:
-  kind: Role
-  name: domaincertificate-editor # Name of the Role created above
+  kind: ClusterRole # Changed from Role
+  name: domaincertificate-editor # Name of the ClusterRole created above
   apiGroup: rbac.authorization.k8s.io
 
 ---

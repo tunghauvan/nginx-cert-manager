@@ -32,24 +32,6 @@ spec:
         value: "ci"
         effect: "NoSchedule" # Adjust effect if needed (e.g., NoExecute)
       initContainers:
-      # Init container to run the setup script for secrets
-      - name: setup-secrets
-        image: registry.asean-accesstrade.net/library/nginx-cert-manager:latest
-        imagePullPolicy: Always
-        # Command to execute the init script
-        command: ["python", "/app/utils/init.py"] 
-        env:
-          # Pass the namespace to the script using the Downward API
-          - name: K8S_NAMESPACE
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.namespace
-          # Pass the webhook service name (adjust if needed)
-          - name: WEBHOOK_SERVICE_NAME
-            value: "webhook-service" 
-          # Ensure Python output isn't buffered
-          - name: PYTHONUNBUFFERED
-            value: "1"
       - name: wait-for-rabbitmq
         image: busybox:1.28 # Small image with networking tools
         # Command to repeatedly check TCP connection to RabbitMQ service on port 5672
