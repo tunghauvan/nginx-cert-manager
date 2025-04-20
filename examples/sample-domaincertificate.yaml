@@ -2,10 +2,10 @@ apiVersion: cert.nginx.io/v1
 kind: DomainCertificate
 metadata:
   name: test-cert-webhook
-  namespace: default
+  namespace: nginx-cert-manager
 spec:
   domain: "webhook-test.asean-accesstrade.net"
-  email: "admin@example.com"
+  email: "tunghau.jp@interspace.vn"
   autoRenewal: true
   dnsProvider: "route53"
   nginxConfigs:
