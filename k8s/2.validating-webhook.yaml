@@ -1,0 +1,26 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: domaincertificate-validation-webhook
+webhooks:
+  - name: validate.domaincertificate.cert.nginx.io
+    rules:
+      - apiGroups: ["cert.nginx.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["domaincertificates"]
+        scope: "Namespaced"
+    clientConfig:
+      # Replace 'webhook-service' and 'default' with the actual
+      # service name and namespace where your agent is running.
+      service:
+        name: webhook-service # Name of the service running the agent
+        namespace: nginx-cert-manager  # Namespace of the service
+        path: "/api/v1/crd/notify"    # The new endpoint in http_agent.py
+        port: 443                      # Webhooks MUST use HTTPS
+      # caBundle: MUST be provided. Base64-encoded CA certificate bundle to verify
+      # the webhook server's certificate. cert-manager can inject this automatically.
+      caBundle: Cg==
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    timeoutSeconds: 5 # Keep timeout short
