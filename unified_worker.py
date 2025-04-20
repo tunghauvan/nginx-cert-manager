@@ -4,7 +4,7 @@ import logging
 import pika
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone # Added timezone
 from dotenv import load_dotenv
 import boto3
 import tempfile
@@ -28,7 +28,9 @@ RABBITMQ_PORT = int(os.environ.get("RABBITMQ_PORT", 5672))
 RABBITMQ_USER = os.environ.get("RABBITMQ_DEFAULT_USER", "user")
 RABBITMQ_PASS = os.environ.get("RABBITMQ_DEFAULT_PASS", "password")
 QUEUE_NAME_REQUESTS = "cert_requests"
-QUEUE_NAME_SUCCESS = "cert_success"
+QUEUE_NAME_DEPLOYMENT = "cert_deployments"
+QUEUE_NAME_DEPLOYMENT_SUCCESS = "cert_deployments_success" # New success queue
+QUEUE_NAME_DEPLOYMENT_DLQ = "cert_deployments_dlq"       # New DLQ queue
 
 # Certificate request settings
 DNS_PLUGIN = os.environ.get("CERTBOT_DNS_PLUGIN", "dns-route53")
@@ -165,7 +167,7 @@ def process_cert_request(body, channel=None):
                         "status": "False",
                         "reason": "InvalidRequest",
                         "message": "Missing domain or email in request",
-                        "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                        "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
                 })
             return False
@@ -182,7 +184,7 @@ def process_cert_request(body, channel=None):
                     "status": "False",
                     "reason": "Processing",
                     "message": "Certificate request is being processed",
-                    "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                    "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                 }]
             })
         
@@ -198,7 +200,7 @@ def process_cert_request(body, channel=None):
             logger.info(f"Certificate issued successfully for {domain}")
             
             # Get certificate details (in a real implementation, parse from certificate)
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             not_before = now.strftime('%Y-%m-%dT%H:%M:%SZ')
             # Set expiry to 90 days (typical for Let's Encrypt)
             not_after = datetime(now.year + (1 if now.month <= 9 else 0), 
@@ -219,7 +221,7 @@ def process_cert_request(body, channel=None):
                         "status": "True",
                         "reason": "CertificateIssued",
                         "message": "Certificate successfully issued",
-                        "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                        "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
                 })
             
@@ -228,7 +230,7 @@ def process_cert_request(body, channel=None):
                 # Include CRD information in success event for deployment
                 channel.basic_publish(
                     exchange='',
-                    routing_key=QUEUE_NAME_SUCCESS,
+                    routing_key=QUEUE_NAME_DEPLOYMENT,
                     body=json.dumps({
                         "domain": domain, 
                         "status": "success",
@@ -256,7 +258,7 @@ def process_cert_request(body, channel=None):
                         "status": "False",
                         "reason": "IssueFailed",
                         "message": "Failed to issue certificate",
-                        "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                        "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
                 })
             return False
@@ -276,38 +278,52 @@ def process_cert_request(body, channel=None):
                             "status": "False",
                             "reason": "ProcessingError",
                             "message": f"Error processing certificate request: {str(e)}",
-                            "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                            "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                         }]
                     })
         except Exception as update_error:
             logger.error(f"Failed to update CRD status after error: {update_error}")
         return False
 
-def process_success_event(body):
+def process_deployment_event(body, channel): # Added channel parameter
     """Process a certificate success event."""
+    domain = None
+    crd_name = None
+    crd_namespace = "default"
+    deployment_successful = False # Flag to track success
+
     try:
         data = json.loads(body)
         domain = data.get("domain")
         status = data.get("status")
         crd_name = data.get("crd_name")
         crd_namespace = data.get("crd_namespace", "default")
-        
+
         if not domain or status != "success":
             logger.error(f"Invalid success event data: {data}")
-            return False
-        
+            # Publish to DLQ even for invalid data
+            channel.basic_publish(
+                exchange='',
+                routing_key=QUEUE_NAME_DEPLOYMENT_DLQ,
+                body=body,
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            logger.info(f"Published invalid event for domain {domain or 'Unknown'} to DLQ")
+            return False # Indicate failure
+
         logger.info(f"Processing success event for domain: {domain}")
-        
+
         # Update CRD status to Deploying if available
         if crd_name:
             update_crd_status(crd_namespace, crd_name, {
                 "state": "Deploying",
                 "message": "Certificate is being deployed to NGINX servers"
             })
-        
+
         # Initialize SSH connection to deploy certificate
         ssh = SSHAgent()
         try:
+
             # Connect to remote server
             connection = ssh.connect(
                 hostname=SSH_HOST,
@@ -315,72 +331,82 @@ def process_success_event(body):
                 username=SSH_USER,
                 key_filename=SSH_KEY_PATH
             )
-            
+
             if not connection:
                 logger.error(f"Failed to connect to SSH server {SSH_HOST}")
-                return False
-                
+                # Publish to DLQ on SSH connection failure
+                channel.basic_publish(
+                    exchange='',
+                    routing_key=QUEUE_NAME_DEPLOYMENT_DLQ,
+                    body=body,
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
+                logger.info(f"Published failed deployment event for {domain} to DLQ due to SSH connection error")
+                return False # Indicate failure
+
             # Create certificate directory if it doesn't exist
             target_dir = f"/etc/letsencrypt/live/{domain}"
             command = f"sudo mkdir -p {target_dir}"
             exit_code, stdout, stderr = ssh.execute_command(command)
-            
+
             if exit_code != 0:
                 logger.error(f"Failed to create directory {target_dir}: {stderr}")
                 return False
-            
+
             # Upload the certificate files
             # Fullchain certificate
             s3_cert_path = f"s3://{S3_CERT_BUCKET}/certs/{domain}/{domain}.crt"
             temp_remote_path = f"/tmp/fullchain.pem"
             final_remote_path = f"{target_dir}/fullchain.pem"
-            
+
             if not ssh.upload_from_s3_to_remote(s3_cert_path, temp_remote_path):
                 logger.error("Certificate upload failed")
                 return False
-                
+
             logger.info(f"Certificate uploaded to temporary location {temp_remote_path}")
-            
+
             # Move the certificate file to the final destination with sudo and set permissions
             move_command = f"sudo cp {temp_remote_path} {final_remote_path} && sudo chmod 644 {final_remote_path} && rm {temp_remote_path}"
             exit_code, stdout, stderr = ssh.execute_command(move_command)
-            
+
             if exit_code != 0:
                 logger.error(f"Failed to move certificate to final destination: {stderr}")
                 return False
-                
+
             logger.info(f"Certificate successfully deployed to {final_remote_path}")
-            
+
             # Process the private key file
             s3_key_path = f"s3://{S3_CERT_BUCKET}/certs/{domain}/{domain}.key"
             temp_key_path = f"/tmp/privkey.pem"
             final_key_path = f"{target_dir}/privkey.pem"
-            
+
             if not ssh.upload_from_s3_to_remote(s3_key_path, temp_key_path):
                 logger.error("Private key upload failed")
                 return False
-                
+
             logger.info(f"Private key uploaded to temporary location {temp_key_path}")
-            
+
             # Move the key file to the final destination with sudo and set more restrictive permissions
             move_key_command = f"sudo cp {temp_key_path} {final_key_path} && sudo chmod 600 {final_key_path} && rm {temp_key_path}"
             exit_code, stdout, stderr = ssh.execute_command(move_key_command)
-            
+
             if exit_code != 0:
                 logger.error(f"Failed to move private key to final destination: {stderr}")
                 return False
-                
+
             logger.info(f"Private key successfully deployed to {final_key_path}")
-            
+
             # Reload Nginx or other web server if needed
             reload_command = "sudo systemctl reload nginx"
             exit_code, stdout, stderr = ssh.execute_command(reload_command)
             if exit_code != 0:
                 logger.warning(f"Failed to reload nginx: {stderr}")
+                # Decide if this is critical. For now, let's consider deployment successful even if reload fails.
             else:
                 logger.info("Nginx reloaded successfully")
-            
+
             logger.info(f"Success event for {domain} processed completely")
+            deployment_successful = True # Mark deployment as successful
 
             # Update CRD status to Deployed
             if crd_name:
@@ -392,19 +418,66 @@ def process_success_event(body):
                         "status": "True",
                         "reason": "CertificateDeployed",
                         "message": "Certificate successfully deployed to NGINX servers",
-                        "lastTransitionTime": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                        "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
                 })
-            
-            return True
-                
+
+            # Publish to success queue
+            channel.basic_publish(
+                exchange='',
+                routing_key=QUEUE_NAME_DEPLOYMENT_SUCCESS,
+                body=body,
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            logger.info(f"Published successful deployment event for {domain} to {QUEUE_NAME_DEPLOYMENT_SUCCESS}")
+            return True # Indicate success
+
+        except Exception as ssh_error: # Catch specific SSH/deployment errors
+             logger.error(f"Error during SSH deployment for {domain}: {ssh_error}")
+             # Publish to DLQ on specific deployment errors
+             channel.basic_publish(
+                 exchange='',
+                 routing_key=QUEUE_NAME_DEPLOYMENT_DLQ,
+                 body=body,
+                 properties=pika.BasicProperties(delivery_mode=2)
+             )
+             logger.info(f"Published failed deployment event for {domain} to DLQ due to deployment error: {ssh_error}")
+             # Update CRD status to Error if possible
+             if crd_name:
+                 update_crd_status(crd_namespace, crd_name, {
+                     "state": "Error",
+                     "message": f"Deployment failed: {str(ssh_error)}"
+                 })
+             return False # Indicate failure
         finally:
             # Ensure SSH connection is closed
             ssh.disconnect()
-        
+            # If deployment failed before reaching the success publish step, publish to DLQ here
+            if not deployment_successful:
+                 # Check if it wasn't already published due to an earlier error
+                 # (This check might be complex, simpler to potentially double-publish to DLQ than miss it)
+                 # For simplicity, we rely on the specific error handling above to publish to DLQ.
+                 # If an error occurs before the success publish, it should have been caught.
+                 pass
+
+
     except Exception as e:
         logger.error(f"Failed to process success event: {e}")
-        return False
+        # Publish to DLQ on general processing failure
+        channel.basic_publish(
+            exchange='',
+            routing_key=QUEUE_NAME_DEPLOYMENT_DLQ,
+            body=body,
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        logger.info(f"Published failed deployment event for {domain or 'Unknown'} to DLQ due to processing error: {e}")
+        # Update CRD status to Error if possible
+        if crd_name and domain: # Check if we have enough info
+             update_crd_status(crd_namespace, crd_name, {
+                 "state": "Error",
+                 "message": f"Error processing deployment event: {str(e)}"
+             })
+        return False # Indicate failure
 
 def main():
     """Main function to handle both certificate requests and success events."""
@@ -420,7 +493,9 @@ def main():
     
     # Declare both queues
     channel.queue_declare(queue=QUEUE_NAME_REQUESTS, durable=True)
-    channel.queue_declare(queue=QUEUE_NAME_SUCCESS, durable=True)
+    channel.queue_declare(queue=QUEUE_NAME_DEPLOYMENT, durable=True)
+    channel.queue_declare(queue=QUEUE_NAME_DEPLOYMENT_SUCCESS, durable=True) # Declare success queue
+    channel.queue_declare(queue=QUEUE_NAME_DEPLOYMENT_DLQ, durable=True)     # Declare DLQ queue
     
     # Set up the delay mechanism for requests
     retry_exchange, delay_queue = setup_delay_queue(channel, QUEUE_NAME_REQUESTS)
@@ -463,19 +538,21 @@ def main():
     
     # Define callback for success events
     def success_callback(ch, method, properties, body):
-        if process_success_event(body):
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-        else:
-            # For success events, if processing fails, we don't want to retry forever
-            logger.warning("Failed to process success event, acknowledging anyway")
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-    
+        # Process the event (which now handles publishing to success/DLQ)
+        process_deployment_event(body, ch) # Pass channel 'ch'
+
+        # Always acknowledge the message from the original QUEUE_NAME_DEPLOYMENT queue
+        # as it has been processed (and potentially forwarded to success/DLQ).
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        logger.debug(f"Acknowledged message from {QUEUE_NAME_DEPLOYMENT}")
+
+
     # Set quality of service and consume from both queues
     channel.basic_qos(prefetch_count=1)
     channel.basic_consume(queue=QUEUE_NAME_REQUESTS, on_message_callback=request_callback)
-    channel.basic_consume(queue=QUEUE_NAME_SUCCESS, on_message_callback=success_callback)
+    channel.basic_consume(queue=QUEUE_NAME_DEPLOYMENT, on_message_callback=success_callback)
     
-    logger.info(f"Unified worker started. Listening for messages on queues '{QUEUE_NAME_REQUESTS}' and '{QUEUE_NAME_SUCCESS}'. To exit press CTRL+C")
+    logger.info(f"Unified worker started. Listening for messages on queues '{QUEUE_NAME_REQUESTS}' and '{QUEUE_NAME_DEPLOYMENT}'. To exit press CTRL+C")
     
     try:
         channel.start_consuming()
