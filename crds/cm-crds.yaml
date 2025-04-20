@@ -80,7 +80,7 @@ spec:
                         description: "Last time the condition transitioned from one status to another"
                 state:
                   type: string
-                  description: "Current state of the certificate (Pending, Issued, Error, Renewing)"
+                  description: "Current state of the certificate (Pending, Processing, Issued, Deployed, Renewing, Error)"
                 notBefore:
                   type: string
                   format: date-time

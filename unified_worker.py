@@ -4,7 +4,7 @@ import logging
 import pika
 import time
 import threading
-from datetime import datetime, timezone # Added timezone
+from datetime import datetime, timezone, timedelta # Added timedelta
 from dotenv import load_dotenv
 import boto3
 import tempfile
@@ -41,6 +41,8 @@ CERTBOT_LOG_DIR = os.environ.get("CERTBOT_LOG_DIR", "/var/log/certbot")
 ACME_DIRECTORY_URL = "https://acme-v02.api.letsencrypt.org/directory"
 RETRY_DELAY_MS = 60000  # 60 seconds in milliseconds
 MAX_RETRY_COUNT = 3  # Maximum number of retries
+RENEWAL_CHECK_INTERVAL_SECONDS = 60 * 60 * 24 # Check once a day
+RENEWAL_THRESHOLD_DAYS = 30 # Renew if expiring within 30 days
 
 # SSH and S3 configuration for deployment
 # SSH_HOST = os.environ.get("SSH_HOST", "172.31.35.222") # No longer primary source for host
@@ -83,6 +85,7 @@ def process_cert_request(body, channel=None):
         # Extract basic information
         domain = data.get("domain")
         email = data.get("email")
+        # action = data.get("action", "issue") # Optional: Distinguish between issue/renew if needed
 
         # Extract CRD information for status updates and fetching spec
         crd_name = data.get("crd_name")
@@ -135,21 +138,26 @@ def process_cert_request(body, channel=None):
                  logger.error(f"An unexpected error occurred while fetching CR {crd_namespace}/{crd_name}: {e}")
 
 
-        # Update CRD status to Processing
-        if crd_name:
-            update_crd_status( # Call imported function
-                k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
-                crd_namespace, crd_name, {
-                "state": "Processing",
-                "message": "Certificate request is being processed",
-                "conditions": [{
-                    "type": "Ready",
-                    "status": "False",
-                    "reason": "Processing",
-                    "message": "Certificate request is being processed",
-                    "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                }]
-            }, logger)
+        # Update CRD status to Processing (or Renewing if action=="renew")
+        # The current update_crd_status logic might overwrite the state if called multiple times,
+        # ensure the state reflects the current action.
+        initial_state = "Processing" # Default state
+        # If we explicitly track renewal, uncomment below
+        # initial_state = "Renewing" if action == "renew" else "Processing"
+
+        update_crd_status( # Call imported function
+            k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+            crd_namespace, crd_name, {
+            "state": initial_state,
+            "message": f"Certificate {initial_state.lower()} started",
+            "conditions": [{
+                "type": "Ready",
+                "status": "False",
+                "reason": initial_state,
+                "message": f"Certificate {initial_state.lower()} started",
+                "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            }]
+        }, logger)
 
         # Request certificate
         if request_certificate(
@@ -160,7 +168,7 @@ def process_cert_request(body, channel=None):
             log_dir=CERTBOT_LOG_DIR
         ):
             # Certificate successfully issued
-            logger.info(f"Certificate issued successfully for {domain}")
+            logger.info(f"Certificate issued/renewed successfully for {domain}")
             
             # Get certificate details (in a real implementation, parse from certificate)
             now = datetime.now(timezone.utc)
@@ -177,7 +185,7 @@ def process_cert_request(body, channel=None):
                     k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
                     crd_namespace, crd_name, {
                     "state": "Issued",
-                    "message": "Certificate issued successfully",
+                    "message": "Certificate issued/renewed successfully",
                     "notBefore": not_before,
                     "notAfter": not_after,
                     "serialNumber": serial_number,
@@ -660,6 +668,142 @@ def process_deployment_event(body, channel): # Added channel parameter
             logger.warning("Cannot update CRD status after processing error because Kubernetes client is unavailable.")
         return False # Indicate failure
 
+# --- Renewal Check Function ---
+def check_and_trigger_renewals(channel, k8s_api, stop_event):
+    """Lists DomainCertificates, checks expiration, and triggers renewals."""
+    logger.info("Starting periodic renewal check...")
+    while not stop_event.is_set():
+        try:
+            if not k8s_api:
+                logger.warning("Kubernetes client not available, skipping renewal check.")
+                # Sleep even if k8s isn't available to avoid a tight loop if it fails temporarily
+                stop_event.wait(RENEWAL_CHECK_INTERVAL_SECONDS)
+                continue
+
+            logger.info("Listing DomainCertificates for renewal check...")
+            cr_list = k8s_api.list_cluster_custom_object(
+                group=CRD_GROUP,
+                version=CRD_VERSION,
+                plural=CRD_PLURAL
+            )
+            logger.info(f"Received {len(cr_list.get('items', []))} DomainCertificates for renewal check.")
+
+            now = datetime.now(timezone.utc)
+            renewal_trigger_time = now + timedelta(days=RENEWAL_THRESHOLD_DAYS)
+
+            for item in cr_list.get('items', []):
+                metadata = item.get('metadata', {})
+                spec = item.get('spec', {})
+                status = item.get('status', {})
+
+                name = metadata.get('name')
+                namespace = metadata.get('namespace', 'default')
+                domain = spec.get('domain')
+                email = spec.get('email')
+                auto_renewal = spec.get('autoRenewal', False)
+                not_after_str = status.get('notAfter')
+                current_state = status.get('state')
+                logger.info(f"Processing CR {namespace}/{name} for domain {domain} with state '{current_state}'")
+
+                if not name or not domain or not email:
+                    logger.info(f"Skipping CR {namespace}/{name} due to missing name, domain, or email.")
+                    continue
+
+                if not auto_renewal:
+                    logger.info(f"Skipping CR {namespace}/{name} for domain {domain}: autoRenewal is false.")
+                    continue
+
+                if not not_after_str:
+                    logger.info(f"Skipping CR {namespace}/{name} for domain {domain}: status.notAfter is not set.")
+                    continue
+
+                # States that indicate an operation is already in progress
+                if current_state in ["Processing", "Renewing", "Deploying"]:
+                     logger.info(f"Skipping CR {namespace}/{name} for domain {domain}: current state is '{current_state}'.")
+                     continue
+
+                try:
+                    # Attempt to parse with different potential formats, including timezone info
+                    not_after_dt = None
+                    formats_to_try = [
+                        '%Y-%m-%dT%H:%M:%SZ',        # ISO 8601 UTC (common)
+                        '%Y-%m-%dT%H:%M:%S.%fZ',     # ISO 8601 UTC with microseconds
+                        '%Y-%m-%d %H:%M:%S %z',      # With timezone offset
+                        '%Y-%m-%d %H:%M:%S',         # Naive datetime (assume UTC)
+                        '%Y-%m-%dT%H:%M:%S%z',       # ISO 8601 with offset
+                    ]
+                    for fmt in formats_to_try:
+                        try:
+                            not_after_dt = datetime.strptime(not_after_str, fmt)
+                            # If parsed datetime is naive, assume UTC
+                            if not_after_dt.tzinfo is None or not_after_dt.tzinfo.utcoffset(not_after_dt) is None:
+                                not_after_dt = not_after_dt.replace(tzinfo=timezone.utc)
+                            break # Stop trying formats once one works
+                        except ValueError:
+                            continue # Try next format
+
+                    if not_after_dt is None:
+                         raise ValueError(f"Could not parse date string '{not_after_str}' with known formats.")
+
+                except ValueError as e:
+                    logger.warning(f"Skipping CR {namespace}/{name} for domain {domain}: Could not parse notAfter date '{not_after_str}': {e}")
+                    continue
+
+                # Check if the expiration date is within the renewal threshold
+                if not_after_dt <= renewal_trigger_time:
+                    logger.info(f"Certificate for domain {domain} ({namespace}/{name}) needs renewal (expires {not_after_str}, threshold {RENEWAL_THRESHOLD_DAYS} days).")
+
+                    # 1. Update CRD status to Renewing
+                    update_crd_status(
+                        k8s_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                        namespace, name, {
+                        "state": "Renewing",
+                        "message": f"Automatic renewal triggered (expires {not_after_str})",
+                        "conditions": [{ # Keep existing conditions or replace? Replacing for simplicity here.
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": "Renewing",
+                            "message": f"Automatic renewal triggered (expires {not_after_str})",
+                            "lastTransitionTime": now.strftime('%Y-%m-%dT%H:%M:%SZ')
+                        }]
+                    }, logger)
+
+                    # 2. Publish renewal request to RabbitMQ
+                    renewal_message = {
+                        "domain": domain,
+                        "email": email,
+                        "crd_name": name,
+                        "crd_namespace": namespace,
+                        # "action": "renew" # Optional: Add action if process_cert_request needs it
+                    }
+                    try:
+                        channel.basic_publish(
+                            exchange='',
+                            routing_key=QUEUE_NAME_REQUESTS,
+                            body=json.dumps(renewal_message),
+                            properties=pika.BasicProperties(delivery_mode=2) # Persistent
+                        )
+                        logger.info(f"Published renewal request for {domain} ({namespace}/{name}) to queue '{QUEUE_NAME_REQUESTS}'.")
+                    except Exception as pub_e:
+                        logger.error(f"Failed to publish renewal request for {domain} ({namespace}/{name}): {pub_e}")
+                        # Optionally revert CRD status back from Renewing if publish fails?
+                        # For now, it will be retried on the next check cycle.
+
+                else:
+                    logger.debug(f"Certificate for domain {domain} ({namespace}/{name}) does not need renewal yet (expires {not_after_str}).")
+
+        except ApiException as e:
+            logger.error(f"Kubernetes API error during renewal check: {e.status} - {e.reason} - {e.body}")
+        except Exception as e:
+            logger.error(f"Unexpected error during renewal check: {e}", exc_info=True) # Log traceback for unexpected errors
+
+        # Wait for the specified interval or until stop event is set
+        logger.debug(f"Renewal check finished. Sleeping for {RENEWAL_CHECK_INTERVAL_SECONDS} seconds...")
+        stop_event.wait(RENEWAL_CHECK_INTERVAL_SECONDS)
+
+    logger.info("Renewal check thread stopped.")
+
+
 def main():
     """Main function to handle both certificate requests and success events."""
     # Connect to RabbitMQ
@@ -732,15 +876,54 @@ def main():
     channel.basic_qos(prefetch_count=1)
     channel.basic_consume(queue=QUEUE_NAME_REQUESTS, on_message_callback=request_callback)
     channel.basic_consume(queue=QUEUE_NAME_DEPLOYMENT, on_message_callback=success_callback)
-    
+
+    # --- Start Renewal Check Thread ---
+    stop_event = threading.Event()
+    renewal_thread = None
+    if k8s_custom_objects_api: # Only start if K8s client is available
+        renewal_thread = threading.Thread(
+            target=check_and_trigger_renewals,
+            args=(channel, k8s_custom_objects_api, stop_event),
+            daemon=True # Allows main thread to exit even if this thread is running
+        )
+        renewal_thread.start()
+        logger.info("Renewal check thread started.")
+    else:
+        logger.warning("Kubernetes client not available, automatic renewal checks disabled.")
+    # --- End Renewal Check Thread ---
+
     logger.info(f"Unified worker started. Listening for messages on queues '{QUEUE_NAME_REQUESTS}' and '{QUEUE_NAME_DEPLOYMENT}'. To exit press CTRL+C")
-    
+
     try:
-        channel.start_consuming()
+        # Keep main thread alive while consuming
+        while True:
+             # Process RabbitMQ events for a short time, then loop
+             # This allows KeyboardInterrupt to be caught more reliably than channel.start_consuming()
+             connection.process_data_events(time_limit=1)
+             # Optional: Check if renewal thread is alive and restart if needed
+             if renewal_thread and not renewal_thread.is_alive() and k8s_custom_objects_api:
+                 logger.warning("Renewal check thread seems to have stopped unexpectedly. Restarting...")
+                 stop_event.clear() # Ensure stop event is clear before restarting
+                 renewal_thread = threading.Thread(
+                     target=check_and_trigger_renewals,
+                     args=(channel, k8s_custom_objects_api, stop_event),
+                     daemon=True
+                 )
+                 renewal_thread.start()
+
     except KeyboardInterrupt:
-        logger.info("Worker stopped by user")
+        logger.info("Worker stopping...")
+        stop_event.set() # Signal renewal thread to stop
+        if renewal_thread:
+            logger.info("Waiting for renewal check thread to finish...")
+            renewal_thread.join(timeout=5) # Wait briefly for thread to exit
+            if renewal_thread.is_alive():
+                logger.warning("Renewal check thread did not stop gracefully.")
     finally:
-        connection.close()
+        if connection.is_open:
+            connection.close()
+            logger.info("RabbitMQ connection closed.")
+        logger.info("Worker stopped.")
 
 if __name__ == "__main__":
     main()
