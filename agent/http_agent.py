@@ -53,13 +53,26 @@ else:
     send_rabbitmq_message = real_send_rabbitmq_message
     # Load Kubernetes configuration only if not mocking
     try:
-        config.load_incluster_config()
-        print("Loaded in-cluster Kubernetes config.")
+        config.load_kube_config()
+        print("Loaded Kubernetes config.")
+        # Print cluster info for debugging
+        cluster_info = config.list_kube_config_contexts()
+        if cluster_info:
+            print(f"Current context: {cluster_info}")
+        else:
+            print("No Kubernetes contexts found.")
         k8s_custom_objects_api = client.CustomObjectsApi()
     except config.ConfigException:
         try:
             config.load_kube_config()
             print("Loaded local Kubernetes config.")
+            # Print cluster info for debugging
+            cluster_info = config.list_kube_config_contexts()
+            if cluster_info:
+                current_context = cluster_info[0]['name']
+                print(f"Current context: {current_context}")
+            else:
+                print("No Kubernetes contexts found.")
             k8s_custom_objects_api = client.CustomObjectsApi()
         except config.ConfigException:
             print("Could not configure Kubernetes client. Status updates will fail.")
@@ -625,6 +638,17 @@ def handle_crd_event():
                 }
             }
             try:
+                print(f"Updating status for DomainCertificate {namespace}/{name} to Pending...")
+                # Get the current status of the CRD (optional, but good practice)
+                print(f"Debug: group={crd_group}, version={crd_version}, namespace={namespace}, plural={crd_plural}, name={name}")
+                current_crd = k8s_custom_objects_api.get_namespaced_custom_object(
+                    group=crd_group,
+                    version=crd_version,
+                    namespace=namespace,
+                    plural=crd_plural,
+                    name=name
+                )
+                print(f"Current status for DomainCertificate {namespace}/{name}: {current_crd.get('status', {})}")
                 k8s_custom_objects_api.patch_namespaced_custom_object_status(
                     group=crd_group,
                     version=crd_version,

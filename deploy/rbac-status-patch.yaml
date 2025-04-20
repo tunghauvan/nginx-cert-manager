@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: domaincertificate-status-patcher
+  namespace: default
+rules:
+- apiGroups: ["cert.nginx.io"]
+  resources: ["domaincertificates", "domaincertificates/status"] # Include both resources for completeness
+  verbs: ["get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: http-agent-patch-status
+  namespace: default
+subjects:
+# Update with your current kubeconfig context user or ServiceAccount
+- kind: User # or ServiceAccount if using a ServiceAccount
+  name: kubernetes-admin # Replace with your actual user from kubectl config view
+  # namespace: default # Uncomment if using a ServiceAccount
+roleRef:
+  kind: Role
+  name: domaincertificate-status-patcher
+  apiGroup: rbac.authorization.k8s.io

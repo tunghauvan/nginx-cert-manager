@@ -1,0 +1,16 @@
+apiVersion: cert.nginx.io/v1
+kind: DomainCertificate
+metadata:
+  name: test-cert-webhook
+  namespace: default
+spec:
+  domain: "webhook-test.asean-accesstrade.net"
+  email: "admin@example.com"
+  autoRenewal: true
+  dnsProvider: "route53"
+  nginxConfigs:
+    - server: "nginx-01"
+      configPath: "/etc/nginx/conf.d/example.conf"
+      certPath: "/etc/nginx/ssl"
+      vhost: "example.com"
+      instanceIp: "172.31.35.222"
