@@ -181,7 +181,14 @@ def serve_http_agent(args, config):
         config: Configuration dictionary
     """
     try:
+        # Ensure the parent directory is in the Python path
+        # This helps Python find the 'agent' module when running entrypoint.py
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        if current_dir not in sys.path:
+            sys.path.insert(0, current_dir)
+            
         # Import the HTTP agent module here to avoid circular imports
+        # and ensure it's found after path adjustment
         from agent.http_agent import app
         
         logger.info(f"Starting HTTP agent on {args.host}:{args.port}")
@@ -200,8 +207,9 @@ def serve_http_agent(args, config):
             ssl_context=ssl_context
         )
         return True
-    except ImportError:
-        logger.error("Failed to import HTTP agent module. Make sure agent/http_agent.py exists.")
+    except ImportError as e:
+        logger.error(f"Failed to import HTTP agent module: {e}. Make sure agent/http_agent.py exists relative to entrypoint.py.")
+        logger.debug(f"Current sys.path: {sys.path}")
         return False
     except Exception as e:
         logger.error(f"Error starting HTTP agent: {e}")
