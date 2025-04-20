@@ -681,45 +681,17 @@ def handle_crd_event():
         admission_response["status"]["message"] = f"Request for {domain} validated and queued."
         response_status_code = 200 # OK
 
-        # --- Update CRD status to Pending (conditionally skip if mocking) ---
-        # This happens *after* the admission response is sent back.
-        # Admission webhooks should be fast. Offload status updates.
-        # Consider moving this logic to the worker that processes the queue message.
-        # For now, keeping it here but acknowledging it might delay the response slightly.
-        if not MOCK_DEPENDENCIES and k8s_custom_objects_api:
-            status_patch = {
-                "status": {
-                    "state": "Pending",
-                    "message": "Certificate request queued for processing.",
-                    "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                }
-            }
-            try:
-                logger.info(f"Attempting to update status for DomainCertificate {namespace}/{name} to Pending...")
-                # Note: This status update might be better handled asynchronously
-                # by the worker consuming the RabbitMQ message to keep the webhook fast.
-                k8s_custom_objects_api.patch_namespaced_custom_object_status(
-                    group=crd_group,
-                    version=crd_version,
-                    namespace=namespace,
-                    plural=crd_plural,
-                    name=name,
-                    body=status_patch
-                )
-                logger.info(f"Successfully initiated status update for DomainCertificate {namespace}/{name} to Pending.")
-                # The admission response itself doesn't change based on status update success/failure here.
-            except ApiException as e:
-                logger.error(f"Error initiating status update for DomainCertificate {namespace}/{name}: {e}")
-                # Log the error, but the admission is already allowed.
-                # The worker should ideally handle setting the status later.
-            except Exception as e: # Catch other potential errors during status update
-                 logger.error(f"Unexpected error during status update initiation for {namespace}/{name}: {e}")
-
-        elif MOCK_DEPENDENCIES:
-            logger.info(f"Mock K8s: Would update status for DomainCertificate {namespace}/{name} to Pending.")
-        else: # Not mocking, but K8s client failed to initialize
-             logger.warning("Kubernetes client not initialized, skipping status update initiation.")
-        # --- End of status update ---
+        # --- CRD Status Update Removed ---
+        # The status update logic has been removed from the admission webhook.
+        # This should be handled by the worker process that consumes the RabbitMQ message
+        # *after* the CRD object has been successfully created in the cluster.
+        if MOCK_DEPENDENCIES:
+            logger.info(f"Mock K8s: Status update for {namespace}/{name} would be handled by worker.")
+        elif not k8s_custom_objects_api:
+             logger.warning("Kubernetes client not initialized. Status update for {namespace}/{name} should be handled by worker.")
+        else:
+             logger.info(f"Status update for {namespace}/{name} will be handled by the worker process.")
+        # --- End of removed status update block ---
 
     else:
         logger.error(f"Failed to send message to RabbitMQ queue for {domain} ({name}/{namespace}).")

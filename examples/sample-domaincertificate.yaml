@@ -4,7 +4,7 @@ metadata:
   name: test-cert-webhook
   namespace: nginx-cert-manager
 spec:
-  domain: "webhook-test.asean-accesstrade.net"
+  domain: "webhook-hehe.asean-accesstrade.net"
   email: "tunghau.jp@interspace.vn"
   autoRenewal: true
   dnsProvider: "route53"
@@ -12,5 +12,5 @@ spec:
     - server: "nginx-01"
       configPath: "/etc/nginx/conf.d/example.conf"
       certPath: "/etc/nginx/ssl"
-      vhost: "example.com"
+      vhost: "asean-accesstrade.net"
       instanceIp: "172.31.35.222"

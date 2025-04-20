@@ -12,7 +12,7 @@ from utils.sshagent import SSHAgent
 from utils.certbot import request_certificate
 from utils.s3 import upload_cert_to_s3
 from utils.rabbitmq import setup_delay_queue # Import from utils
-from utils.kubernetes import update_crd_status # Import from utils
+from utils.k8s_utils import update_crd_status # Import from renamed utils file
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
@@ -40,7 +40,7 @@ CERTBOT_CONFIG_DIR = os.environ.get("CERTBOT_CONFIG_DIR", "/etc/certbot")
 CERTBOT_LOG_DIR = os.environ.get("CERTBOT_LOG_DIR", "/var/log/certbot")
 ACME_DIRECTORY_URL = "https://acme-v02.api.letsencrypt.org/directory"
 RETRY_DELAY_MS = 60000  # 60 seconds in milliseconds
-MAX_RETRY_COUNT = 5  # Maximum number of retries
+MAX_RETRY_COUNT = 3  # Maximum number of retries
 
 # SSH and S3 configuration for deployment
 # SSH_HOST = os.environ.get("SSH_HOST", "172.31.35.222") # No longer primary source for host
@@ -262,7 +262,7 @@ def process_deployment_event(body, channel): # Added channel parameter
     domain = None
     crd_name = None
     crd_namespace = "default"
-    instance_ip = None # Variable for instance IP
+    instance_ip = None # Variable for instance IP - will be fetched from CR
     deployment_successful = False # Flag to track success
 
     try:
@@ -271,10 +271,10 @@ def process_deployment_event(body, channel): # Added channel parameter
         status = data.get("status")
         crd_name = data.get("crd_name")
         crd_namespace = data.get("crd_namespace", "default")
-        instance_ip = data.get("instanceIp") # Get instance IP from message
+        # instance_ip = data.get("instanceIp") # REMOVED: Get instance IP from message
 
-        if not domain or status != "success":
-            logger.error(f"Invalid success event data: {data}")
+        if not domain or status != "success" or not crd_name: # Added check for crd_name
+            logger.error(f"Invalid success event data (missing domain, crd_name, or status not 'success'): {data}")
             # Publish to DLQ even for invalid data
             channel.basic_publish(
                 exchange='',
@@ -283,38 +283,104 @@ def process_deployment_event(body, channel): # Added channel parameter
                 properties=pika.BasicProperties(delivery_mode=2)
             )
             logger.info(f"Published invalid event for domain {domain or 'Unknown'} to DLQ")
-            return False # Indicate failure
-
-        if not instance_ip:
-            logger.error(f"Missing 'instanceIp' in deployment event for domain {domain}. Cannot proceed with SSH deployment.")
-            # Publish to DLQ because we can't connect
-            channel.basic_publish(
-                exchange='',
-                routing_key=QUEUE_NAME_DEPLOYMENT_DLQ,
-                body=body,
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
-            logger.info(f"Published failed deployment event for {domain} to DLQ due to missing instanceIp")
-            # Update CRD status if possible
+            # Try to update CRD status if possible, though unlikely with missing info
             if crd_name:
-                 update_crd_status( # Call imported function
+                 update_crd_status(
                      k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
                      crd_namespace, crd_name, {
                      "state": "Error",
-                     "message": "Deployment failed: Missing instance IP address in deployment event."
+                     "message": "Deployment failed: Invalid deployment event data received."
                  }, logger)
             return False # Indicate failure
 
+        # Fetch the CR to get instanceIp if k8s client is available
+        if k8s_custom_objects_api:
+            try:
+                logger.info(f"Fetching CR {crd_namespace}/{crd_name} to get instanceIp for deployment.")
+                cr_object = k8s_custom_objects_api.get_namespaced_custom_object(
+                    group=CRD_GROUP,
+                    version=CRD_VERSION,
+                    namespace=crd_namespace,
+                    plural=CRD_PLURAL,
+                    name=crd_name
+                )
+                # Extract instanceIp from the first nginxConfig entry (adjust if needed)
+                nginx_configs = cr_object.get('spec', {}).get('nginxConfigs', [])
+                if nginx_configs and isinstance(nginx_configs, list) and len(nginx_configs) > 0:
+                    instance_ip = nginx_configs[0].get('instanceIp')
+                    if not instance_ip:
+                         logger.error(f"CR {crd_namespace}/{crd_name} found, but 'instanceIp' is missing in the first nginxConfigs entry.")
+                         # Publish to DLQ because we can't connect without IP
+                         channel.basic_publish(exchange='', routing_key=QUEUE_NAME_DEPLOYMENT_DLQ, body=body, properties=pika.BasicProperties(delivery_mode=2))
+                         logger.info(f"Published failed deployment event for {domain} to DLQ due to missing instanceIp in CR.")
+                         update_crd_status(
+                             k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                             crd_namespace, crd_name, {
+                             "state": "Error",
+                             "message": "Deployment failed: Missing 'instanceIp' in CR spec.nginxConfigs."
+                         }, logger)
+                         return False # Indicate failure
+                    else:
+                        logger.info(f"Found instanceIp '{instance_ip}' in CR {crd_namespace}/{crd_name}.")
+                else:
+                    logger.error(f"CR {crd_namespace}/{crd_name} found, but 'nginxConfigs' array is missing, empty, or not a list.")
+                    # Publish to DLQ
+                    channel.basic_publish(exchange='', routing_key=QUEUE_NAME_DEPLOYMENT_DLQ, body=body, properties=pika.BasicProperties(delivery_mode=2))
+                    logger.info(f"Published failed deployment event for {domain} to DLQ due to missing nginxConfigs in CR.")
+                    update_crd_status(
+                        k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                        crd_namespace, crd_name, {
+                        "state": "Error",
+                        "message": "Deployment failed: Missing 'nginxConfigs' array in CR spec."
+                    }, logger)
+                    return False # Indicate failure
+
+            except ApiException as e:
+                logger.error(f"Failed to fetch CR {crd_namespace}/{crd_name} to get instanceIp: {e.status} - {e.reason}")
+                # Publish to DLQ
+                channel.basic_publish(exchange='', routing_key=QUEUE_NAME_DEPLOYMENT_DLQ, body=body, properties=pika.BasicProperties(delivery_mode=2))
+                logger.info(f"Published failed deployment event for {domain} to DLQ due to K8s API error fetching CR.")
+                update_crd_status(
+                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                    crd_namespace, crd_name, {
+                    "state": "Error",
+                    "message": f"Deployment failed: Could not fetch CR details ({e.status} - {e.reason})."
+                }, logger)
+                return False # Indicate failure
+            except Exception as e:
+                 logger.error(f"An unexpected error occurred while fetching CR {crd_namespace}/{crd_name}: {e}")
+                 # Publish to DLQ
+                 channel.basic_publish(exchange='', routing_key=QUEUE_NAME_DEPLOYMENT_DLQ, body=body, properties=pika.BasicProperties(delivery_mode=2))
+                 logger.info(f"Published failed deployment event for {domain} to DLQ due to unexpected error fetching CR.")
+                 update_crd_status(
+                     k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                     crd_namespace, crd_name, {
+                     "state": "Error",
+                     "message": f"Deployment failed: Unexpected error fetching CR details: {str(e)}."
+                 }, logger)
+                 return False # Indicate failure
+        else:
+            # Kubernetes client not available - cannot proceed with deployment if IP wasn't somehow passed (which it isn't anymore)
+            logger.error("Kubernetes client not available. Cannot fetch instanceIp from CR to proceed with deployment.")
+            # Publish to DLQ
+            channel.basic_publish(exchange='', routing_key=QUEUE_NAME_DEPLOYMENT_DLQ, body=body, properties=pika.BasicProperties(delivery_mode=2))
+            logger.info(f"Published failed deployment event for {domain} to DLQ due to unavailable K8s client.")
+            # Cannot update CRD status without the client
+            return False # Indicate failure
+
+
+        # Removed the check for instance_ip here as it's handled during CR fetching above.
+        # if not instance_ip: ...
+
         logger.info(f"Processing success event for domain: {domain}, deploying to instance: {instance_ip}")
 
-        # Update CRD status to Deploying if available
-        if crd_name:
-            update_crd_status( # Call imported function
-                k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
-                crd_namespace, crd_name, {
-                "state": "Deploying",
-                "message": f"Certificate is being deployed to NGINX server at {instance_ip}"
-            }, logger)
+        # Update CRD status to Deploying if available (k8s_client check is implicitly done above)
+        update_crd_status( # Call imported function
+            k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+            crd_namespace, crd_name, {
+            "state": "Deploying",
+            "message": f"Certificate is being deployed to NGINX server at {instance_ip}"
+        }, logger)
 
         # Initialize SSH connection to deploy certificate
         ssh = SSHAgent()
@@ -529,38 +595,37 @@ def process_deployment_event(body, channel): # Added channel parameter
                  properties=pika.BasicProperties(delivery_mode=2)
              )
              logger.info(f"Published failed deployment event for {domain} to DLQ due to deployment error on {instance_ip}: {ssh_error}")
-             # Update CRD status to Error if possible
-             if crd_name:
-                 # Prepare status update payload for error
-                 error_status_payload = {
-                     "state": "Error",
-                     "message": f"Deployment failed on {instance_ip}: {str(ssh_error)}"
-                     # Optionally add/update a 'Deployed' condition with status False
-                 }
-                 # Add deployedTo status for the failure attempt
-                 deployed_to_list = []
-                 try:
-                     current_cr = k8s_custom_objects_api.get_namespaced_custom_object(
-                         group=CRD_GROUP, version=CRD_VERSION, namespace=crd_namespace, plural=CRD_PLURAL, name=crd_name
-                     )
-                     deployed_to_list = current_cr.get('status', {}).get('deployedTo', [])
-                     if not isinstance(deployed_to_list, list): deployed_to_list = []
-                 except Exception: pass # Ignore errors fetching status during error handling
+             # Update CRD status to Error if possible (k8s_client check implicitly done above)
+             # Prepare status update payload for error
+             error_status_payload = {
+                 "state": "Error",
+                 "message": f"Deployment failed on {instance_ip}: {str(ssh_error)}"
+                 # Optionally add/update a 'Deployed' condition with status False
+             }
+             # Add deployedTo status for the failure attempt
+             deployed_to_list = []
+             try:
+                 current_cr = k8s_custom_objects_api.get_namespaced_custom_object(
+                     group=CRD_GROUP, version=CRD_VERSION, namespace=crd_namespace, plural=CRD_PLURAL, name=crd_name
+                 )
+                 deployed_to_list = current_cr.get('status', {}).get('deployedTo', [])
+                 if not isinstance(deployed_to_list, list): deployed_to_list = []
+             except Exception: pass # Ignore errors fetching status during error handling
 
-                 deploy_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                 failed_deployment_entry = {
-                     "server": instance_ip,
-                     "deployTime": deploy_time,
-                     "status": "Failed",
-                     "error": str(ssh_error) # Add error message
-                 }
-                 deployed_to_list = [entry for entry in deployed_to_list if entry.get('server') != instance_ip]
-                 deployed_to_list.append(failed_deployment_entry)
-                 error_status_payload["deployedTo"] = deployed_to_list
+             deploy_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+             failed_deployment_entry = {
+                 "server": instance_ip,
+                 "deployTime": deploy_time,
+                 "status": "Failed",
+                 "error": str(ssh_error) # Add error message
+             }
+             deployed_to_list = [entry for entry in deployed_to_list if entry.get('server') != instance_ip]
+             deployed_to_list.append(failed_deployment_entry)
+             error_status_payload["deployedTo"] = deployed_to_list
 
-                 update_crd_status( # Call imported function
-                     k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
-                     crd_namespace, crd_name, error_status_payload, logger)
+             update_crd_status( # Call imported function
+                 k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                 crd_namespace, crd_name, error_status_payload, logger)
 
              return False # Indicate failure
         finally:
@@ -583,14 +648,16 @@ def process_deployment_event(body, channel): # Added channel parameter
         )
         logger.info(f"Published failed deployment event for {domain or 'Unknown'} to DLQ due to processing error: {e}")
         # Update CRD status to Error if possible
-        if crd_name and domain: # Check if we have enough info
+        if crd_name and domain and k8s_custom_objects_api: # Check if we have enough info and k8s client
              update_crd_status( # Call imported function
                  k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
                  crd_namespace, crd_name, {
                  "state": "Error",
                  "message": f"Error processing deployment event: {str(e)}",
-                 "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                 # "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') # update_crd_status handles this
              }, logger)
+        elif crd_name and domain:
+            logger.warning("Cannot update CRD status after processing error because Kubernetes client is unavailable.")
         return False # Indicate failure
 
 def main():
