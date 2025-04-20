@@ -15,7 +15,7 @@ webhooks:
       # service name and namespace where your agent is running.
       service:
         name: nginx-cert-manager-agent # Name of the service running the agent
-        namespace: default             # Namespace of the service
+        namespace: nginx-cert-manager  # Namespace of the service
         path: "/admission/validate"    # The new endpoint in http_agent.py
         port: 443                      # Webhooks MUST use HTTPS
       # caBundle: MUST be provided. Base64-encoded CA certificate bundle to verify
