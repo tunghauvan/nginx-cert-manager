@@ -1,0 +1,130 @@
+# NGINX Certificate Manager
+
+A comprehensive tool for automating SSL certificate management for NGINX servers, including issuance, renewal, and deployment.
+
+## Features
+
+- **Certificate Issuance**: Obtain SSL certificates from Let's Encrypt using DNS validation
+- **Route53 Integration**: Automatic DNS challenge handling with AWS Route53
+- **Certificate Renewal**: Automatic renewal of certificates before expiration
+- **Certificate Deployment**: Securely deploy certificates to NGINX servers
+- **Command-line Interface**: Easy-to-use CLI for all operations
+- **Configuration Management**: Support for environment variables and config files
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/nginx-cert-manager.git
+cd nginx-cert-manager
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+## Usage
+
+### Issue a new certificate
+
+```bash
+python entrypoint.py issue --domain example.com --email admin@example.com
+```
+
+### Renew certificates
+
+```bash
+# Renew all certificates
+python entrypoint.py renew
+
+# Renew a specific certificate
+python entrypoint.py renew --domain example.com
+```
+
+### Deploy a certificate to an NGINX server
+
+```bash
+python entrypoint.py deploy --domain example.com --server nginx.example.com --username admin --key-path ~/.ssh/id_rsa
+```
+
+## SSH with Python
+
+This project includes functionality to execute commands on remote servers via SSH using Python. This is useful for deploying certificates and configuring NGINX remotely.
+
+### Requirements
+
+- Python 3.6+
+- Paramiko library: `pip install paramiko`
+
+### Basic Usage
+
+The `ssh_utils.py` module provides functions for SSH operations:
+
+```python
+from ssh_utils import execute_ssh_command
+
+# Example usage
+result = execute_ssh_command(
+    hostname="your-server.com",
+    username="user",
+    password="password",  # Or use key-based auth
+    command="sudo nginx -t"
+)
+
+print(f"Exit code: {result['exit_code']}")
+print(f"Output: {result['output']}")
+```
+
+### Advanced SSH Operations
+
+The SSH utilities support various operations:
+
+- **File Transfer**: Upload certificates to remote servers
+- **Command Execution**: Run configuration commands
+- **Service Management**: Restart NGINX after deploying certificates
+- **Permission Management**: Set proper permissions for certificate files
+
+Example for uploading a certificate:
+
+```python
+from ssh_utils import upload_file
+
+upload_file(
+    hostname="your-server.com",
+    username="user", 
+    key_path="~/.ssh/id_rsa",
+    local_path="/path/to/certificate.pem",
+    remote_path="/etc/nginx/ssl/certificate.pem"
+)
+```
+
+## Configuration
+
+Configuration can be provided via:
+
+1. Command-line arguments
+2. Environment variables
+3. Configuration files
+
+### Environment Variables
+
+- `AWS_ACCESS_KEY_ID`: AWS access key for Route53 API
+- `AWS_SECRET_ACCESS_KEY`: AWS secret key for Route53 API
+- `AWS_REGION`: AWS region (default: us-east-1)
+
+## Development
+
+### Testing
+
+Run tests with unittest:
+
+```bash
+python -m unittest discover tests
+```
+
+### Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Submit a pull request
+
+See the example scripts in the project for more detailed usage scenarios.

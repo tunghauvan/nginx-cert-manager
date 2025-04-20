@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+NGINX Certificate Manager - Entrypoint
+
+This is the main entrypoint for the NGINX Certificate Manager application,
+which helps automate certificate issuance and installation on NGINX servers.
+"""
+
+import argparse
+import logging
+import os
+import sys
+from typing import Dict, Any
+
+# Import local modules
+from utils.route53 import Route53Manager
+
+# Initialize logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("nginx-cert-manager")
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="NGINX Certificate Manager - Automate SSL certificate management for NGINX"
+    )
+
+    # Main command subparsers
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    
+    # Create parser for 'issue' command
+    issue_parser = subparsers.add_parser("issue", help="Issue a new SSL certificate")
+    issue_parser.add_argument("--domain", "-d", required=True, help="Domain name for the certificate")
+    issue_parser.add_argument("--email", "-e", required=True, help="Email address for Let's Encrypt notifications")
+    issue_parser.add_argument("--dns-provider", choices=["route53"], default="route53", help="DNS provider for DNS challenge")
+    
+    # Create parser for 'renew' command
+    renew_parser = subparsers.add_parser("renew", help="Renew existing certificates")
+    renew_parser.add_argument("--domain", "-d", help="Specific domain to renew (renews all if not specified)")
+    
+    # Create parser for 'deploy' command
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy certificate to NGINX server")
+    deploy_parser.add_argument("--domain", "-d", required=True, help="Domain name of the certificate to deploy")
+    deploy_parser.add_argument("--server", "-s", required=True, help="NGINX server hostname or IP")
+    deploy_parser.add_argument("--username", "-u", required=True, help="SSH username")
+    deploy_parser.add_argument("--key-path", "-k", help="Path to SSH private key")
+    deploy_parser.add_argument("--password", "-p", help="SSH password (not recommended, use key-based auth)")
+    
+    # AWS credentials for Route53
+    aws_group = parser.add_argument_group("AWS Route53 Configuration")
+    aws_group.add_argument("--aws-access-key", help="AWS Access Key ID")
+    aws_group.add_argument("--aws-secret-key", help="AWS Secret Access Key")
+    aws_group.add_argument("--aws-region", default="us-east-1", help="AWS Region")
+    
+    # General options
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--config", "-c", help="Path to configuration file")
+
+    return parser.parse_args()
+
+
+def load_config(config_path: str = None) -> Dict[str, Any]:
+    """
+    Load configuration from file if specified, otherwise use defaults.
+    
+    Args:
+        config_path: Path to configuration file
+        
+    Returns:
+        Dictionary containing configuration values
+    """
+    config = {
+        "aws_access_key": os.environ.get("AWS_ACCESS_KEY_ID"),
+        "aws_secret_key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        "aws_region": os.environ.get("AWS_REGION", "us-east-1"),
+    }
+    
+    # TODO: Add code to load configuration from file when needed
+    
+    return config
+
+
+def issue_certificate(args, config):
+    """
+    Issue a new SSL certificate using DNS validation.
+    
+    Args:
+        args: Command line arguments
+        config: Configuration dictionary
+    """
+    logger.info(f"Issuing new certificate for {args.domain}")
+    
+    # Initialize Route53 for DNS validation if using Route53
+    if args.dns_provider == "route53":
+        route53 = Route53Manager(
+            aws_access_key=args.aws_access_key or config.get("aws_access_key"),
+            aws_secret_key=args.aws_secret_key or config.get("aws_secret_key"),
+            aws_region=args.aws_region or config.get("aws_region")
+        )
+        
+        # Get zone ID for the domain
+        zone_id = route53.get_hosted_zone_id(args.domain)
+        if not zone_id:
+            logger.error(f"No hosted zone found for domain {args.domain}")
+            return False
+        
+        logger.info(f"Found hosted zone ID: {zone_id} for domain {args.domain}")
+        
+        # TODO: Implement certificate issuance with Let's Encrypt using DNS challenge
+    
+    return True
+
+
+def renew_certificates(args, config):
+    """
+    Renew existing certificates.
+    
+    Args:
+        args: Command line arguments
+        config: Configuration dictionary
+    """
+    if args.domain:
+        logger.info(f"Renewing certificate for {args.domain}")
+    else:
+        logger.info("Renewing all certificates")
+    
+    # TODO: Implement certificate renewal logic
+    
+    return True
+
+
+def deploy_certificate(args, config):
+    """
+    Deploy certificate to NGINX server via SSH.
+    
+    Args:
+        args: Command line arguments
+        config: Configuration dictionary
+    """
+    logger.info(f"Deploying certificate for {args.domain} to server {args.server}")
+    
+    # TODO: Implement SSH deployment logic using the functionality mentioned in the README
+    
+    return True
+
+
+def main():
+    """Main entry point for the application."""
+    args = parse_arguments()
+    
+    # Set logging level based on verbosity
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
+    
+    # Load configuration
+    config = load_config(args.config)
+    
+    # Override config with command line arguments
+    for key in ["aws_access_key", "aws_secret_key", "aws_region"]:
+        if getattr(args, key, None):
+            config[key] = getattr(args, key)
+    
+    # Execute requested command
+    result = False
+    
+    if args.command == "issue":
+        result = issue_certificate(args, config)
+    elif args.command == "renew":
+        result = renew_certificates(args, config)
+    elif args.command == "deploy":
+        result = deploy_certificate(args, config)
+    else:
+        logger.error("No command specified. Use --help to see available commands.")
+        return 1
+    
+    # Return appropriate exit code
+    return 0 if result else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
