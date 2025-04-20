@@ -19,6 +19,7 @@ from flask import Flask, request, jsonify
 
 # Import local modules
 from utils.route53 import Route53Manager
+from utils.rabbitmq import send_rabbitmq_message
 
 # Create Flask application
 app = Flask(__name__)
@@ -500,6 +501,66 @@ def list_certificates():
         return jsonify(result), 500
     
     return jsonify(result), 200
+
+
+@app.route('/api/v1/crd/notify', methods=['POST'])
+@require_auth
+def handle_crd_event():
+    """Handle create/update events for DomainCertificate CRDs."""
+    data = request.get_json()
+    
+    # Basic validation of incoming data structure
+    if not data or 'spec' not in data:
+        return jsonify({
+            'success': False, 
+            'error': 'Invalid CRD data: Missing spec field'
+        }), 400
+        
+    spec = data.get('spec', {})
+    domain = spec.get('domain')
+    email = spec.get('email')
+    
+    if not domain or not email:
+        return jsonify({
+            'success': False, 
+            'error': 'Invalid CRD data: Missing domain or email in spec'
+        }), 400
+        
+    # Get Hosted Zone ID using Route53Manager
+    route53 = Route53Manager()
+    hosted_zone_id = route53.get_hosted_zone_id(domain)
+    
+    if not hosted_zone_id:
+        # Decide how to handle missing zone ID - fail early or let worker handle?
+        # For now, let's log and potentially let the worker decide.
+        # Or return an error:
+        # return jsonify({
+        #     'success': False,
+        #     'error': f'Could not find Route53 hosted zone for domain {domain}'
+        # }), 400
+        print(f"Warning: Could not find Route53 hosted zone for domain {domain}") # Or use proper logging
+
+    # Construct message for RabbitMQ
+    message = {
+        "action": "issue_certificate", # Assuming CRD event triggers issuance
+        "domain": domain,
+        "email": email,
+        "hosted_zone_id": hosted_zone_id, # Add the hosted zone ID
+        # Add other relevant fields from spec if needed by the worker
+        # e.g., "dnsProvider": spec.get('dnsProvider') 
+    }
+    
+    # Send message to the certificate request queue
+    if send_rabbitmq_message("cert_requests", message):
+        return jsonify({
+            'success': True, 
+            'message': f'Certificate request for {domain} sent to queue.'
+        }), 202 # Accepted
+    else:
+        return jsonify({
+            'success': False, 
+            'error': 'Failed to send message to RabbitMQ queue.'
+        }), 500
 
 
 if __name__ == '__main__':

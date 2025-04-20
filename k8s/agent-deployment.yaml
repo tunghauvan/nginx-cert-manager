@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  # Name of the Deployment
+  name: nginx-cert-manager-agent
+  # Namespace where the agent will run
+  namespace: default 
+  labels:
+    # Label for the Deployment itself
+    app: nginx-cert-manager-agent
+spec:
+  replicas: 1 # Start with one replica, adjust as needed
+  selector:
+    matchLabels:
+      # Selector to match the Pods managed by this Deployment
+      app: nginx-cert-manager-agent
+  template:
+    metadata:
+      labels:
+        # Labels applied to the Pods - MUST match spec.selector.matchLabels and Service selector
+        app: nginx-cert-manager-agent 
+    spec:
+      containers:
+        - name: agent
+          # Replace with the actual image name and tag you built
+          image: nginx:latest 
+          imagePullPolicy: IfNotPresent # Or Always, depending on your image tagging strategy
+          ports:
+            # Port the container listens on (should match targetPort in the Service)
+            # Define the HTTPS port if the webhook runs directly in the container
+            - containerPort: 5000 # Adjust if your agent listens on a different port for HTTPS/HTTP
+              name: http-or-https # Name this appropriately (e.g., 'https-webhook' or 'http-api')
+          env:
+            # Environment variables needed by the agent
+            - name: RABBITMQ_HOST
+              value: "rabbitmq.default.svc.cluster.local" # Example using K8s service DNS
+            - name: RABBITMQ_PORT
+              value: "5672"
+            - name: AWS_REGION
+              value: "us-east-1" # Or your desired region
+            # Load sensitive credentials from Secrets
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: agent-secrets # Name of the Secret containing RabbitMQ user
+                  key: rabbitmq_user
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: agent-secrets # Name of the Secret containing RabbitMQ password
+                  key: rabbitmq_password
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: agent-secrets # Name of the Secret containing AWS keys
+                  key: aws_access_key_id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agent-secrets # Name of the Secret containing AWS keys
+                  key: aws_secret_access_key
+            # Add other necessary env vars (e.g., SSH_USER, S3_BUCKET)
+            - name: SSH_USER
+              value: "ubuntu" # Or load from secret/configmap
+            - name: S3_CERT_BUCKET
+              value: "your-s3-bucket-name" # Or load from secret/configmap
+            # Define path for SSH key within the container
+            - name: SSH_KEY_PATH 
+              value: "/root/.ssh/key.pem" # Matches the volumeMount path
+              
+          volumeMounts:
+            # Mount the TLS certificate and key for the webhook server
+            - name: webhook-tls-certs
+              mountPath: "/etc/webhook/certs" # Path inside the container where certs will be mounted
+              readOnly: true
+            # Mount the SSH private key
+            - name: ssh-key-volume
+              mountPath: "/root/.ssh" # Mount to the expected location for SSHAgent/Paramiko
+              readOnly: true
+            # Optional: Mount API tokens if they are complex and stored in a file within a secret
+            # - name: api-token-volume
+            #   mountPath: "/etc/agent/tokens"
+            #   readOnly: true
+
+      volumes:
+        # Define the volume sourced from the webhook TLS secret
+        - name: webhook-tls-certs
+          secret:
+            secretName: webhook-tls-secret # Name of the Secret containing tls.crt and tls.key
+        # Define the volume sourced from the SSH key secret
+        - name: ssh-key-volume
+          secret:
+            secretName: ssh-key-secret # Name of the Secret containing the SSH private key
+            defaultMode: 0400 # Set restrictive permissions for the key file
+            items:
+              - key: key.pem # Key within the secret containing the private key data
+                path: key.pem # Filename inside the mountPath (/root/.ssh/key.pem)
+        # Optional: Define volume for API tokens if stored in a secret file
+        # - name: api-token-volume
+        #   secret:
+        #     secretName: agent-secrets 
+        #     items:
+        #       - key: api_tokens.json # Assuming tokens are in a JSON file within the secret
+        #         path: tokens.json

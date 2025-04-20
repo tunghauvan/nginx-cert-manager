@@ -49,27 +49,39 @@ class Route53Manager:
     
     def get_hosted_zone_id(self, domain_name):
         """
-        Get the hosted zone ID for a given domain name.
+        Get the hosted zone ID for a given domain name by checking the domain
+        and its parent domains.
         
         Args:
-            domain_name (str): Domain name to find the hosted zone for
+            domain_name (str): Domain name (e.g., 'www.example.com')
             
         Returns:
             str: Hosted zone ID if found, None otherwise
         """
         try:
             zones = self.list_hosted_zones()
-            for zone in zones:
-                # Remove trailing dot from zone name for comparison
-                zone_name = zone['Name'].rstrip('.')
-                if zone_name == domain_name:
-                    # Extract ID from the format '/hostedzone/Z123456789'
-                    return zone['Id'].split('/')[-1]
-                    
-            logger.warning(f"No hosted zone found for domain {domain_name}")
+            # Normalize domain name (remove trailing dot if present)
+            normalized_domain = domain_name.rstrip('.')
+            domain_parts = normalized_domain.split('.')
+            
+            # Iterate from the full domain down to the base domain (e.g., example.com)
+            for i in range(len(domain_parts) - 1):
+                current_domain_to_check = '.'.join(domain_parts[i:])
+                
+                for zone in zones:
+                    # Remove trailing dot from zone name for comparison
+                    zone_name = zone['Name'].rstrip('.')
+                    if zone_name == current_domain_to_check:
+                        # Extract ID from the format '/hostedzone/Z123456789'
+                        zone_id = zone['Id'].split('/')[-1]
+                        logger.info(f"Found hosted zone {zone_id} ({zone_name}) for domain {domain_name}")
+                        return zone_id
+                        
+            logger.warning(f"No hosted zone found for domain {domain_name} or its parents.")
             return None
         except Exception as e:
             logger.error(f"Error finding hosted zone for {domain_name}: {e}")
+            # Re-raise the exception to signal a failure in the operation
             raise
     
     def create_dns_record(self, zone_id, record_name, record_type, record_value, ttl=300):
