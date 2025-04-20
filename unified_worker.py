@@ -6,9 +6,10 @@ import time
 import threading
 from dotenv import load_dotenv
 import boto3
-import subprocess
 import tempfile
 from utils.sshagent import SSHAgent
+from utils.certbot import request_certificate
+from utils.s3 import upload_cert_to_s3
 
 load_dotenv()
 
@@ -76,122 +77,6 @@ def setup_delay_queue(channel, queue_name):
     logger.info(f"Configured delay queue: {delay_queue_name} with TTL: {RETRY_DELAY_MS}ms")
     return retry_exchange_name, delay_queue_name
 
-def upload_cert_to_s3(domain, cert_dir):
-    """Upload certificate files to S3 bucket"""
-    try:
-        s3_bucket = S3_CERT_BUCKET
-        s3_prefix = f"certs/{domain}/"  # Use domain-specific folder
-        
-        logger.info(f"Uploading certificate files for {domain} to S3 bucket {s3_bucket}/{s3_prefix}")
-        
-        s3_client = boto3.client('s3')
-        
-        # Upload certificate files
-        cert_path = os.path.join(cert_dir, f"{domain}.crt")
-        key_path = os.path.join(cert_dir, f"{domain}.key")
-        chain_path = os.path.join(cert_dir, f"{domain}.chain.crt")
-        
-        # Upload to domain-specific folders
-        s3_client.upload_file(
-            cert_path, 
-            s3_bucket, 
-            f"{s3_prefix}{domain}.crt"
-        )
-        
-        s3_client.upload_file(
-            key_path, 
-            s3_bucket, 
-            f"{s3_prefix}{domain}.key"
-        )
-        
-        s3_client.upload_file(
-            chain_path, 
-            s3_bucket, 
-            f"{s3_prefix}{domain}.chain.crt"
-        )
-        
-        logger.info(f"Successfully uploaded certificate files for {domain} to S3 folder {s3_prefix}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to upload certificate files to S3: {e}")
-        return False
-
-def request_certificate(domain, email):
-    """
-    Request a certificate using Certbot with DNS challenge.
-    """
-    logger.info(f"Requesting certificate for {domain} using Certbot with DNS challenge")
-    try:
-        # return True  # Placeholder for actual certificate request logic
-        # Ensure output directories exist
-        cert_dir = os.environ.get("CERT_OUTPUT_DIR", "/etc/nginx/ssl")
-        os.makedirs(cert_dir, exist_ok=True)
-        os.makedirs(CERTBOT_CONFIG_DIR, exist_ok=True)
-        os.makedirs(CERTBOT_LOG_DIR, exist_ok=True)
-        
-        # Build the certbot command
-        cmd = [
-            "certbot", "certonly", "--non-interactive",
-            "--agree-tos", "--email", email,
-            "--preferred-challenges", "dns",
-            f"--{DNS_PLUGIN}",
-            "-d", domain,
-            "--cert-name", domain.replace(".", "-"),
-            "--config-dir", CERTBOT_CONFIG_DIR,
-            "--logs-dir", CERTBOT_LOG_DIR,
-            "--force-renewal"
-        ]
-        
-        # Run certbot command
-        logger.info(f"Running certbot command: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False  # Don't raise exception, we'll handle errors manually
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"Certbot command failed: {result.stderr}")
-            return False
-        
-        logger.info(f"Certbot successfully obtained certificate: {result.stdout}")
-        
-        # Certbot puts certificates in a specific directory structure
-        # Copy the certificates to our desired location
-        cert_path = os.path.join(
-            CERTBOT_CONFIG_DIR, "live", domain.replace(".", "-"), "fullchain.pem"
-        )
-        key_path = os.path.join(
-            CERTBOT_CONFIG_DIR, "live", domain.replace(".", "-"), "privkey.pem"
-        )
-        chain_path = os.path.join(
-            CERTBOT_CONFIG_DIR, "live", domain.replace(".", "-"), "chain.pem"
-        )
-        
-        # Copy certificates to nginx directory
-        with open(cert_path, 'r') as src_file, open(os.path.join(cert_dir, f"{domain}.crt"), 'w') as dest_file:
-            dest_file.write(src_file.read())
-            
-        with open(key_path, 'r') as src_file, open(os.path.join(cert_dir, f"{domain}.key"), 'w') as dest_file:
-            dest_file.write(src_file.read())
-            
-        with open(chain_path, 'r') as src_file, open(os.path.join(cert_dir, f"{domain}.chain.crt"), 'w') as dest_file:
-            dest_file.write(src_file.read())
-            
-        logger.info(f"Certificate files copied to {cert_dir} for {domain}")
-        
-        # Upload certificates to S3
-        if upload_cert_to_s3(domain, cert_dir):
-            logger.info(f"Certificate files for {domain} uploaded to S3 successfully")
-        else:
-            logger.warning(f"Failed to upload certificate files for {domain} to S3, but continuing...")
-        
-        return True
-    except Exception as e:
-        logger.error(f"Failed to request certificate for {domain}: {e}")
-        return False
-
 def process_cert_request(body, channel=None):
     try:
         data = json.loads(body)
@@ -204,8 +89,14 @@ def process_cert_request(body, channel=None):
         
         logger.info(f"Processing certificate request for {domain} with email {email}")
 
-        # Request certificate (blocking)
-        if request_certificate(domain, email):
+        # Request certificate using the utility function
+        if request_certificate(
+            domain, 
+            email, 
+            dns_plugin=DNS_PLUGIN,
+            config_dir=CERTBOT_CONFIG_DIR,
+            log_dir=CERTBOT_LOG_DIR
+        ):
             # Publish success event to RabbitMQ
             if channel:
                 channel.basic_publish(
