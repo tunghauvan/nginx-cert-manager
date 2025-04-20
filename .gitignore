@@ -1,7 +1,22 @@
 .venv
-__pycache__/*.py[cod]
-*.py[cod]
-*.pyo
-*.pyc
-*.pytest_cache
+.vscode
+.idea
+
+
 .env
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.crt
+*.cer
+*.csr
+.scannerwork
+__pycache__
+*.egg-info
+.env
+
+# pycache
+__pycache__/
+*.pyc
