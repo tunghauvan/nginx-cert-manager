@@ -7,6 +7,7 @@ HTTP clients and SSH-based NGINX servers for certificate management.
 """
 
 import json
+import logging # Added
 import os
 import subprocess
 import uuid
@@ -23,15 +24,22 @@ from kubernetes.client.rest import ApiException
 from utils.route53 import Route53Manager as RealRoute53Manager # Rename original
 from utils.rabbitmq import send_rabbitmq_message as real_send_rabbitmq_message # Rename original
 
+# --- Logging Setup ---
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+# --- End Logging Setup ---
+
+
 # --- Mocking Setup ---
 MOCK_DEPENDENCIES = os.environ.get("MOCK_DEPENDENCIES", "false").lower() == "true"
 
 # Mock Route53Manager
 class MockRoute53Manager:
     def __init__(self, *args, **kwargs):
-        print("Initialized MockRoute53Manager")
+        logger.info("Initialized MockRoute53Manager") # Changed from print
     def get_hosted_zone_id(self, domain_name):
-        print(f"MockRoute53Manager: Called get_hosted_zone_id for {domain_name}")
+        logger.info(f"MockRoute53Manager: Called get_hosted_zone_id for {domain_name}") # Changed from print
         # Return a dummy ID or None based on your testing needs
         if "nozone" in domain_name:
             return None
@@ -39,12 +47,12 @@ class MockRoute53Manager:
 
 # Mock send_rabbitmq_message
 def mock_send_rabbitmq_message(queue_name, message):
-    print(f"MockRabbitMQ: Would send to queue '{queue_name}': {json.dumps(message)}")
+    logger.info(f"MockRabbitMQ: Would send to queue '{queue_name}': {json.dumps(message)}") # Changed from print
     return True # Simulate successful sending
 
 # Conditionally use real or mock implementations
 if MOCK_DEPENDENCIES:
-    print("--- MOCKING ENABLED for Kubernetes, RabbitMQ, Route53 ---")
+    logger.info("--- MOCKING ENABLED for Kubernetes, RabbitMQ, Route53 ---") # Changed from print
     Route53Manager = MockRoute53Manager
     send_rabbitmq_message = mock_send_rabbitmq_message
     k8s_custom_objects_api = None # Prevent K8s API usage
@@ -53,29 +61,24 @@ else:
     send_rabbitmq_message = real_send_rabbitmq_message
     # Load Kubernetes configuration only if not mocking
     try:
-        config.load_kube_config()
-        print("Loaded Kubernetes config.")
-        # Print cluster info for debugging
-        cluster_info = config.list_kube_config_contexts()
-        if cluster_info:
-            print(f"Current context: {cluster_info}")
-        else:
-            print("No Kubernetes contexts found.")
+        config.load_incluster_config() # Try loading in-cluster config first
+        logger.info("Loaded in-cluster Kubernetes config.")
         k8s_custom_objects_api = client.CustomObjectsApi()
     except config.ConfigException:
+        logger.info("In-cluster config failed, trying kube config...")
         try:
             config.load_kube_config()
-            print("Loaded local Kubernetes config.")
+            logger.info("Loaded local Kubernetes config.")
             # Print cluster info for debugging
             cluster_info = config.list_kube_config_contexts()
             if cluster_info:
                 current_context = cluster_info[0]['name']
-                print(f"Current context: {current_context}")
+                logger.info(f"Current context: {current_context}") # Changed from print
             else:
-                print("No Kubernetes contexts found.")
+                logger.warning("No Kubernetes contexts found.") # Changed from print
             k8s_custom_objects_api = client.CustomObjectsApi()
         except config.ConfigException:
-            print("Could not configure Kubernetes client. Status updates will fail.")
+            logger.error("Could not configure Kubernetes client (in-cluster or local). Status updates will fail.") # Changed from print
             k8s_custom_objects_api = None # Ensure it's None if loading fails
 # --- End Mocking Setup ---
 
@@ -327,7 +330,7 @@ class CertificateManager:
                         })
                     except (json.JSONDecodeError, KeyError) as e:
                         # If there's an issue with one certificate, continue with others
-                        print(f"Error reading certificate {cert_id}: {str(e)}")
+                        logger.error(f"Error reading certificate {cert_id}: {str(e)}") # Changed from print
             
             # For testing purposes, add a mock certificate if no certificates found
             if not certificates and os.environ.get('TESTING', '').lower() == 'true':
@@ -467,7 +470,7 @@ def health_check():
 
 
 @app.route('/api/v1/certificates/issue', methods=['POST'])
-@require_auth
+# @require_auth # Removed decorator
 def issue_certificate():
     """Issue a new certificate."""
     data = request.get_json()
@@ -489,7 +492,7 @@ def issue_certificate():
 
 
 @app.route('/api/v1/certificates/deploy', methods=['POST'])
-@require_auth
+# @require_auth # Removed decorator
 def deploy_certificate():
     """Deploy a certificate to a server."""
     data = request.get_json()
@@ -515,7 +518,7 @@ def deploy_certificate():
 
 
 @app.route('/api/v1/certificates/<certificate_id>', methods=['GET'])
-@require_auth
+# @require_auth # Removed decorator
 def get_certificate(certificate_id):
     """Get certificate status."""
     result = certificate_manager.get_certificate_status(certificate_id)
@@ -539,7 +542,7 @@ def get_certificate(certificate_id):
 
 
 @app.route('/api/v1/certificates/<certificate_id>/renew', methods=['POST'])
-@require_auth
+# @require_auth # Removed decorator
 def renew_certificate(certificate_id):
     """Renew a certificate."""
     result = certificate_manager.renew_certificate(certificate_id)
@@ -551,7 +554,7 @@ def renew_certificate(certificate_id):
 
 
 @app.route('/api/v1/certificates', methods=['GET'])
-@require_auth
+# @require_auth # Removed decorator
 def list_certificates():
     """List all managed certificates."""
     result = certificate_manager.list_certificates()
@@ -563,54 +566,101 @@ def list_certificates():
 
 
 @app.route('/api/v1/crd/notify', methods=['POST'])
-@require_auth
+# @require_auth # Removed decorator
 def handle_crd_event():
     """
-    Handle create/update events for DomainCertificate CRDs.
-    Queues the request and updates the CRD status to Pending.
+    Handle create/update events for DomainCertificate CRDs from Admission Webhook.
+    Validates the request, queues it if valid, and returns an AdmissionReview response.
     (Mocks dependencies if MOCK_DEPENDENCIES=true)
     """
-    data = request.get_json()
-    
-    # Basic validation of incoming data structure
+    logger.info("Received CRD event via Admission Webhook.")
+    admission_response = {
+        "allowed": False, # Default to not allowed
+        "status": {}
+    }
+    response_status_code = 400 # Default to Bad Request
+
+    try:
+        admission_review = request.get_json()
+        if not admission_review or 'request' not in admission_review:
+            logger.error("Invalid AdmissionReview structure: Missing 'request' field.")
+            admission_response["status"]["message"] = "Invalid AdmissionReview structure: Missing 'request' field."
+            # No UID available yet
+            return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": admission_response}), response_status_code
+
+        # --- Get the request UID ---
+        request_uid = admission_review.get("request", {}).get("uid")
+        if not request_uid:
+             logger.error("Invalid AdmissionReview structure: Missing 'request.uid' field.")
+             admission_response["status"]["message"] = "Invalid AdmissionReview structure: Missing 'request.uid' field."
+             # Still return an AdmissionReview, but UID might be missing in the response
+             return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": {"uid": request_uid, **admission_response}}), response_status_code
+        else:
+            # Set the UID for the response early
+            admission_response["uid"] = request_uid
+
+
+        logger.debug("Debug: AdmissionReview data: %s", admission_review)
+
+        # Extract the actual CRD object from the AdmissionReview request
+        if 'object' not in admission_review['request']:
+             logger.error("Invalid AdmissionReview structure: Missing 'request.object'.")
+             admission_response["status"]["message"] = "Invalid AdmissionReview structure: Missing 'request.object'."
+             return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": admission_response}), response_status_code
+
+        data = admission_review['request']['object'] # Get the CRD object
+        logger.info(f"Extracted CRD event data: {json.dumps(data, indent=2)}")
+
+    except Exception as e:
+        logger.error(f"Error parsing AdmissionReview JSON data: {e}")
+        admission_response["status"]["message"] = f"Error parsing AdmissionReview JSON data: {e}"
+        # Use UID if available
+        if 'request_uid' in locals() and request_uid:
+             admission_response["uid"] = request_uid
+        return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": admission_response}), response_status_code
+
+    # Basic validation of incoming CRD data structure
     if not data or 'spec' not in data or 'metadata' not in data:
-        return jsonify({
-            'success': False, 
-            'error': 'Invalid CRD data: Missing spec or metadata field'
-        }), 400
-        
+        logger.error("Invalid CRD data: Missing spec or metadata field.")
+        admission_response["status"]["message"] = "Invalid CRD data: Missing spec or metadata field."
+        return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": admission_response}), response_status_code
+
     metadata = data.get('metadata', {})
     spec = data.get('spec', {})
-    
+
     name = metadata.get('name')
     namespace = metadata.get('namespace')
     domain = spec.get('domain')
     email = spec.get('email')
-    
+
     # CRD details (adjust if your CRD definition differs)
     crd_group = "cert.nginx.io"
     crd_version = "v1"
     crd_plural = "domaincertificates"
-    
+
     if not all([name, namespace, domain, email]):
-        return jsonify({
-            'success': False, 
-            'error': 'Invalid CRD data: Missing name, namespace, domain, or email'
-        }), 400
-        
+        logger.error("Invalid CRD data: Missing name, namespace, domain, or email.")
+        admission_response["status"]["message"] = "Invalid CRD data: Missing name, namespace, domain, or email."
+        return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": admission_response}), response_status_code
+
     # Get Hosted Zone ID using Route53Manager (potentially mocked)
     route53 = Route53Manager()
     hosted_zone_id = None
     try:
         hosted_zone_id = route53.get_hosted_zone_id(domain)
         if not hosted_zone_id:
-            print(f"Warning: Could not find Route53 hosted zone for domain {domain}") # Or use proper logging
-            # Optionally fail here if zone is strictly required before queueing
-            # return jsonify({'success': False, 'error': f'Could not find Route53 hosted zone for domain {domain}'}), 400
+            logger.warning(f"Could not find Route53 hosted zone for domain {domain}")
+            # Decide if this is a fatal error for admission
+            # For now, let's allow it but log a warning. If it's required, set allowed=False.
+            # admission_response["allowed"] = False
+            # admission_response["status"]["message"] = f"Validation failed: Could not find Route53 hosted zone for domain {domain}"
+            # return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": admission_response}), 400
     except Exception as e:
-        print(f"Error getting hosted zone ID for {domain}: {e}")
-        # Optionally fail here
-        # return jsonify({'success': False, 'error': f'Error finding Route53 zone: {e}'}), 500
+        logger.error(f"Error getting hosted zone ID for {domain}: {e}")
+        # Decide if this is a fatal error for admission
+        admission_response["status"]["message"] = f"Internal error checking Route53 hosted zone for domain {domain}: {e}"
+        # Don't set allowed=False here, let it proceed but log the error. Could also deny.
+        # return jsonify({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": admission_response}), 500 # Internal Server Error
 
     # Construct message for RabbitMQ
     message = {
@@ -621,34 +671,33 @@ def handle_crd_event():
         "crd_name": name, # Pass CRD info for potential status updates by worker
         "crd_namespace": namespace,
         # Add other relevant fields from spec if needed by the worker
-        # e.g., "dnsProvider": spec.get('dnsProvider') 
+        # e.g., "dnsProvider": spec.get('dnsProvider')
     }
-    
+
     # Send message to the certificate request queue (potentially mocked)
     if send_rabbitmq_message("cert_requests", message):
-        print(f"Certificate request for {domain} ({name}/{namespace}) sent to queue.")
-        
+        logger.info(f"Certificate request for {domain} ({name}/{namespace}) sent to queue.")
+        admission_response["allowed"] = True
+        admission_response["status"]["message"] = f"Request for {domain} validated and queued."
+        response_status_code = 200 # OK
+
         # --- Update CRD status to Pending (conditionally skip if mocking) ---
+        # This happens *after* the admission response is sent back.
+        # Admission webhooks should be fast. Offload status updates.
+        # Consider moving this logic to the worker that processes the queue message.
+        # For now, keeping it here but acknowledging it might delay the response slightly.
         if not MOCK_DEPENDENCIES and k8s_custom_objects_api:
             status_patch = {
                 "status": {
                     "state": "Pending",
                     "message": "Certificate request queued for processing.",
-                    "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') 
+                    "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                 }
             }
             try:
-                print(f"Updating status for DomainCertificate {namespace}/{name} to Pending...")
-                # Get the current status of the CRD (optional, but good practice)
-                print(f"Debug: group={crd_group}, version={crd_version}, namespace={namespace}, plural={crd_plural}, name={name}")
-                current_crd = k8s_custom_objects_api.get_namespaced_custom_object(
-                    group=crd_group,
-                    version=crd_version,
-                    namespace=namespace,
-                    plural=crd_plural,
-                    name=name
-                )
-                print(f"Current status for DomainCertificate {namespace}/{name}: {current_crd.get('status', {})}")
+                logger.info(f"Attempting to update status for DomainCertificate {namespace}/{name} to Pending...")
+                # Note: This status update might be better handled asynchronously
+                # by the worker consuming the RabbitMQ message to keep the webhook fast.
                 k8s_custom_objects_api.patch_namespaced_custom_object_status(
                     group=crd_group,
                     version=crd_version,
@@ -657,42 +706,33 @@ def handle_crd_event():
                     name=name,
                     body=status_patch
                 )
-                print(f"Successfully updated status for DomainCertificate {namespace}/{name} to Pending.")
-                return jsonify({
-                    'success': True, 
-                    'message': f'Certificate request for {domain} sent to queue and status updated to Pending.'
-                }), 202 # Accepted
+                logger.info(f"Successfully initiated status update for DomainCertificate {namespace}/{name} to Pending.")
+                # The admission response itself doesn't change based on status update success/failure here.
             except ApiException as e:
-                print(f"Error updating status for DomainCertificate {namespace}/{name}: {e}")
-                # Proceed but indicate status update failure in response or logs
-                return jsonify({
-                    'success': True, # Request was queued, but status update failed
-                    'message': f'Certificate request for {domain} sent to queue, but failed to update CRD status.',
-                    'status_update_error': str(e)
-                }), 207 # Multi-Status (optional, 202 might be simpler)
-            # Note: Removed NameError check as k8s_custom_objects_api is checked directly
+                logger.error(f"Error initiating status update for DomainCertificate {namespace}/{name}: {e}")
+                # Log the error, but the admission is already allowed.
+                # The worker should ideally handle setting the status later.
+            except Exception as e: # Catch other potential errors during status update
+                 logger.error(f"Unexpected error during status update initiation for {namespace}/{name}: {e}")
+
         elif MOCK_DEPENDENCIES:
-            print(f"Mock K8s: Would update status for DomainCertificate {namespace}/{name} to Pending.")
-            return jsonify({
-                'success': True, 
-                'message': f'Certificate request for {domain} sent to queue (mocked). K8s status update skipped (mocked).'
-            }), 202 # Accepted
+            logger.info(f"Mock K8s: Would update status for DomainCertificate {namespace}/{name} to Pending.")
         else: # Not mocking, but K8s client failed to initialize
-             print("Kubernetes client not initialized, skipping status update.")
-             return jsonify({
-                'success': True,
-                'message': f'Certificate request for {domain} sent to queue. K8s client not available for status update.'
-             }), 202 # Accepted
+             logger.warning("Kubernetes client not initialized, skipping status update initiation.")
         # --- End of status update ---
-            
+
     else:
-        print(f"Failed to send message to RabbitMQ queue for {domain} ({name}/{namespace}).")
-        return jsonify({
-            'success': False, 
-            'error': 'Failed to send message to RabbitMQ queue.'
-        }), 500
+        logger.error(f"Failed to send message to RabbitMQ queue for {domain} ({name}/{namespace}).")
+        admission_response["allowed"] = False
+        admission_response["status"]["message"] = "Failed to queue certificate request."
+        response_status_code = 500 # Internal Server Error
 
 
-if __name__ == '__main__':
-    # For development only - use a proper WSGI server for production
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Construct the final AdmissionReview response
+    final_response = {
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "response": admission_response # Contains uid, allowed, status
+    }
+    logger.info(f"Sending AdmissionReview response: {json.dumps(final_response)}")
+    return jsonify(final_response), response_status_code

@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   # Name of the Service - should match the name used in the ValidatingWebhookConfiguration
-  name: nginx-cert-manager-agent
+  name: webhook-service
   # Namespace where the agent deployment and this service reside
   namespace: nginx-cert-manager 
   labels:
@@ -19,10 +19,10 @@ spec:
       # TargetPort should match the port your agent container listens on for HTTPS
       # If your agent listens on 5000 for HTTPS (e.g., using Flask's ssl_context), use 5000.
       # If it listens on a different port like 8443, use that.
-      targetPort: 5000 # Adjust if your agent's HTTPS port is different
+      targetPort: 8443 # Adjust if your agent's HTTPS port is different
       
     - name: http-api      # Optional: Port for the regular HTTP API (if needed internally)
       protocol: TCP
-      port: 5000          # Port the service listens on for HTTP
-      targetPort: 5000    # Port the agent container listens on for HTTP
+      port: 8080          # Port the service listens on for HTTP
+      targetPort: 8080    # Port the agent container listens on for HTTP
   # type: ClusterIP # Default type, usually sufficient for internal services like webhooks

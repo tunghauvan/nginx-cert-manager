@@ -20,25 +20,35 @@ spec:
         # Labels applied to the Pods - MUST match spec.selector.matchLabels and Service selector
         app: nginx-cert-manager-agent 
     spec:
+      # Add the Service Account name here
+      serviceAccountName: nginx-cert-manager-agent-sa 
       containers:
         - name: agent
           # Replace with the actual image name and tag you built
-          image: nginx:latest 
-          imagePullPolicy: IfNotPresent # Or Always, depending on your image tagging strategy
+          image: registry.asean-accesstrade.net/library/nginx-cert-manager:0.1.11
+          imagePullPolicy: Always # Or Always, depending on your image tagging strategy
+          # Change command to sleep if you want to keep the container running without doing anything
+          # command: ["/bin/sh", "-c", "sleep 3600"]
           ports:
             # Port the container listens on (should match targetPort in the Service)
             # Define the HTTPS port if the webhook runs directly in the container
-            - containerPort: 5000 # Adjust if your agent listens on a different port for HTTPS/HTTP
+            - containerPort: 8443 # Adjust if your agent listens on a different port for HTTPS/HTTP
               name: http-or-https # Name this appropriately (e.g., 'https-webhook' or 'http-api')
           env:
             # Environment variables needed by the agent
             - name: RABBITMQ_HOST
               # Use the Kubernetes Service name for RabbitMQ within the cluster
               value: "rabbitmq.nginx-cert-manager.svc.cluster.local" 
+              # PYTHONUNBUFFERED=1
+              # Ensures that Python output is sent straight to the terminal without buffering
+            - name: PYTHONUNBUFFERED
+              value: "1" # Ensures that Python output is sent straight to the terminal without buffering
+            - name: DEBUG
+              value: "1" # Set to "1" for debugging, "0" for production
+            - name: FLASK_DEBUG
+              value: "1" # Set to "1" for debugging, "0" for production
             - name: RABBITMQ_PORT
               value: "5672"
-            - name: AWS_REGION
-              value: "us-east-1" # Or your desired region
             # Load sensitive credentials from Secrets
             - name: RABBITMQ_DEFAULT_USER
               valueFrom:
@@ -50,16 +60,6 @@ spec:
                 secretKeyRef:
                   name: agent-secrets # Name of the Secret containing RabbitMQ password
                   key: rabbitmq_password
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: agent-secrets # Name of the Secret containing AWS keys
-                  key: aws_access_key_id
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: agent-secrets # Name of the Secret containing AWS keys
-                  key: aws_secret_access_key
             # Add other necessary env vars (e.g., SSH_USER, S3_BUCKET)
             - name: SSH_USER
               value: "ubuntu" # Or load from secret/configmap

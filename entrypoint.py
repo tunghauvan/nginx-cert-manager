@@ -191,21 +191,46 @@ def serve_http_agent(args, config):
         # and ensure it's found after path adjustment
         from agent.http_agent import app
         
-        logger.info(f"Starting HTTP agent on {args.host}:{args.port}")
+        # Determine debug mode based on flag or environment variable
+        debug_mode = args.debug or os.environ.get("DEBUG", "").lower() in ["true", "1", "yes"]
+        if debug_mode:
+            logger.info("Debug mode enabled.")
+
+        logger.info(f"Starting HTTP agent...")
+
+        cert_path = '/etc/webhook/certs/tls.crt'
+        key_path = '/etc/webhook/certs/tls.key'
         
-        # Configure SSL if certificates are provided
-        ssl_context = None
-        if args.cert and args.key:
-            logger.info("Using SSL with provided certificate and key")
-            ssl_context = (args.cert, args.key)
-        
-        # Start the Flask application
-        app.run(
-            host=args.host,
-            port=args.port,
-            debug=args.debug,
-            ssl_context=ssl_context
-        )
+        logger.info(f"Checking for TLS certificate at: {cert_path}")
+        logger.info(f"Checking for TLS key at: {key_path}")
+
+        cert_exists = os.path.exists(cert_path)
+        key_exists = os.path.exists(key_path)
+
+        logger.info(f"Certificate exists: {cert_exists}")
+        logger.info(f"Key exists: {key_exists}")
+
+        # Check if TLS cert and key files exist (path relevant inside the container)
+        if cert_exists and key_exists:
+            logger.info(f"Attempting to start HTTPS server on host {args.host or '0.0.0.0'}, port 8443")
+            try:
+                # Run with HTTPS using mounted certs
+                app.run(
+                    host=args.host or '0.0.0.0', 
+                    port=8443, 
+                    ssl_context=(cert_path, key_path), 
+                    debug=debug_mode # Use combined debug status
+                )
+            except Exception as ssl_error:
+                logger.error(f"Failed to start HTTPS server: {ssl_error}", exc_info=True) # Log the full traceback
+                logger.error("Please ensure the certificate and key files are valid PEM format and readable.")
+                return False # Indicate failure
+        else:
+            logger.warning("TLS certificate or key not found at expected path.")
+            logger.info(f"Starting HTTP server on host {args.host or '0.0.0.0'}, port 8080")
+            # Fallback to HTTP if certs are missing
+            app.run(host=args.host or '0.0.0.0', port=8080, debug=debug_mode) # Use combined debug status
+            
         return True
     except ImportError as e:
         logger.error(f"Failed to import HTTP agent module: {e}. Make sure agent/http_agent.py exists relative to entrypoint.py.")
