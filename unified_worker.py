@@ -11,6 +11,8 @@ import tempfile
 from utils.sshagent import SSHAgent
 from utils.certbot import request_certificate
 from utils.s3 import upload_cert_to_s3
+from utils.rabbitmq import setup_delay_queue # Import from utils
+from utils.kubernetes import update_crd_status # Import from utils
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
@@ -41,7 +43,7 @@ RETRY_DELAY_MS = 60000  # 60 seconds in milliseconds
 MAX_RETRY_COUNT = 5  # Maximum number of retries
 
 # SSH and S3 configuration for deployment
-SSH_HOST = os.environ.get("SSH_HOST", "172.31.35.222")
+# SSH_HOST = os.environ.get("SSH_HOST", "172.31.35.222") # No longer primary source for host
 SSH_PORT = int(os.environ.get("SSH_PORT", 22))
 SSH_USER = os.environ.get("SSH_USER", "ubuntu")
 SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/root/.ssh/key.pem")
@@ -70,96 +72,28 @@ except Exception as e:
     logger.warning(f"Failed to initialize Kubernetes client: {e}")
     logger.warning("CRD status updates will be disabled")
 
-def setup_delay_queue(channel, queue_name):
-    """
-    Set up the queues and exchanges needed for delayed message processing
-    """
-    # Create the retry exchange
-    retry_exchange_name = f"{queue_name}_retry_exchange"
-    channel.exchange_declare(
-        exchange=retry_exchange_name,
-        exchange_type='direct',
-        durable=True
-    )
-    
-    # Create the delay queue with the specified TTL (time-to-live)
-    delay_queue_name = f"{queue_name}_delay_queue"
-    arguments = {
-        'x-dead-letter-exchange': '',  # Default exchange
-        'x-dead-letter-routing-key': queue_name,  # Route back to the original queue
-        'x-message-ttl': RETRY_DELAY_MS,  # Delay time in milliseconds
-    }
-    channel.queue_declare(
-        queue=delay_queue_name,
-        durable=True,
-        arguments=arguments
-    )
-    
-    # Bind the delay queue to the retry exchange
-    channel.queue_bind(
-        queue=delay_queue_name,
-        exchange=retry_exchange_name,
-        routing_key=delay_queue_name
-    )
-    
-    logger.info(f"Configured delay queue: {delay_queue_name} with TTL: {RETRY_DELAY_MS}ms")
-    return retry_exchange_name, delay_queue_name
-
-def update_crd_status(namespace, name, status_data):
-    """
-    Update the status of a DomainCertificate CRD
-    
-    Args:
-        namespace: Namespace of the CRD
-        name: Name of the CRD
-        status_data: Dictionary containing status fields to update
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    if not k8s_custom_objects_api:
-        logger.warning(f"Kubernetes client not initialized, skipping status update for {namespace}/{name}")
-        return False
-        
-    try:
-        # Create the status patch
-        status_patch = {
-            "status": status_data
-        }
-        
-        # Update the CRD status
-        k8s_custom_objects_api.patch_namespaced_custom_object_status(
-            group=CRD_GROUP,
-            version=CRD_VERSION,
-            namespace=namespace,
-            plural=CRD_PLURAL,
-            name=name,
-            body=status_patch
-        )
-        
-        logger.info(f"Updated status for DomainCertificate {namespace}/{name} to {status_data.get('state', 'Unknown')}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update status for DomainCertificate {namespace}/{name}: {e}")
-        return False
-
 def process_cert_request(body, channel=None):
+    instance_ip = None # Variable to store instance IP
+    crd_name = None
+    crd_namespace = "default"
     try:
         data = json.loads(body)
         logger.info(f"Received certificate request: {data}")
-        
+
         # Extract basic information
         domain = data.get("domain")
         email = data.get("email")
-        
-        # Extract CRD information for status updates
+
+        # Extract CRD information for status updates and fetching spec
         crd_name = data.get("crd_name")
         crd_namespace = data.get("crd_namespace", "default")
-        
+
         if not domain or not email:
             logger.error("Missing domain or email in request")
             if crd_name:
-                update_crd_status(crd_namespace, crd_name, {
+                update_crd_status( # Call imported function
+                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                    crd_namespace, crd_name, {
                     "state": "Error",
                     "message": "Missing domain or email in request",
                     "conditions": [{
@@ -169,14 +103,43 @@ def process_cert_request(body, channel=None):
                         "message": "Missing domain or email in request",
                         "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
-                })
+                }, logger)
             return False
-        
+
         logger.info(f"Processing certificate request for {domain} with email {email}")
-        
+
+        # Fetch the CR to get instanceIp if k8s client is available
+        if crd_name and k8s_custom_objects_api:
+            try:
+                cr_object = k8s_custom_objects_api.get_namespaced_custom_object(
+                    group=CRD_GROUP,
+                    version=CRD_VERSION,
+                    namespace=crd_namespace,
+                    plural=CRD_PLURAL,
+                    name=crd_name
+                )
+                # Extract instanceIp from the first nginxConfig entry (adjust if needed)
+                nginx_configs = cr_object.get('spec', {}).get('nginxConfigs', [])
+                if nginx_configs and isinstance(nginx_configs, list) and len(nginx_configs) > 0:
+                    instance_ip = nginx_configs[0].get('instanceIp')
+                    if not instance_ip:
+                         logger.warning(f"CR {crd_namespace}/{crd_name} found, but 'instanceIp' is missing in the first nginxConfigs entry.")
+                else:
+                    logger.warning(f"CR {crd_namespace}/{crd_name} found, but 'nginxConfigs' array is missing, empty, or not a list.")
+
+            except ApiException as e:
+                logger.error(f"Failed to fetch CR {crd_namespace}/{crd_name} to get instanceIp: {e}")
+                # Decide if this is a fatal error for the request processing
+                # For now, we'll log and continue, deployment might fail later if IP is needed
+            except Exception as e:
+                 logger.error(f"An unexpected error occurred while fetching CR {crd_namespace}/{crd_name}: {e}")
+
+
         # Update CRD status to Processing
         if crd_name:
-            update_crd_status(crd_namespace, crd_name, {
+            update_crd_status( # Call imported function
+                k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                crd_namespace, crd_name, {
                 "state": "Processing",
                 "message": "Certificate request is being processed",
                 "conditions": [{
@@ -186,12 +149,12 @@ def process_cert_request(body, channel=None):
                     "message": "Certificate request is being processed",
                     "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                 }]
-            })
-        
+            }, logger)
+
         # Request certificate
         if request_certificate(
-            domain, 
-            email, 
+            domain,
+            email,
             dns_plugin=DNS_PLUGIN,
             config_dir=CERTBOT_CONFIG_DIR,
             log_dir=CERTBOT_LOG_DIR
@@ -210,7 +173,9 @@ def process_cert_request(body, channel=None):
             
             # Update CRD status to Issued with certificate details
             if crd_name:
-                update_crd_status(crd_namespace, crd_name, {
+                update_crd_status( # Call imported function
+                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                    crd_namespace, crd_name, {
                     "state": "Issued",
                     "message": "Certificate issued successfully",
                     "notBefore": not_before,
@@ -223,23 +188,28 @@ def process_cert_request(body, channel=None):
                         "message": "Certificate successfully issued",
                         "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
-                })
-            
-            # Publish success event to RabbitMQ with CRD information
+                }, logger)
+
+            # Publish success event to RabbitMQ with CRD information AND instanceIp
             if channel:
-                # Include CRD information in success event for deployment
+                deployment_payload = {
+                    "domain": domain,
+                    "status": "success",
+                    "crd_name": crd_name,
+                    "crd_namespace": crd_namespace
+                }
+                if instance_ip: # Only include instance_ip if found
+                    deployment_payload["instanceIp"] = instance_ip
+                else:
+                    logger.warning(f"Instance IP not found for {domain}, deployment message will not include it.")
+
                 channel.basic_publish(
                     exchange='',
                     routing_key=QUEUE_NAME_DEPLOYMENT,
-                    body=json.dumps({
-                        "domain": domain, 
-                        "status": "success",
-                        "crd_name": crd_name,
-                        "crd_namespace": crd_namespace
-                    }),
+                    body=json.dumps(deployment_payload),
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
-                logger.info(f"Published success event for {domain}")
+                logger.info(f"Published success event for {domain} with payload: {deployment_payload}")
             else:
                 logger.warning("No channel provided, couldn't publish success event")
 
@@ -247,10 +217,12 @@ def process_cert_request(body, channel=None):
         else:
             # Certificate request failed
             logger.error(f"Certificate request failed for {domain}")
-            
+
             # Update CRD status to Error
             if crd_name:
-                update_crd_status(crd_namespace, crd_name, {
+                update_crd_status( # Call imported function
+                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                    crd_namespace, crd_name, {
                     "state": "Error",
                     "message": "Failed to issue certificate",
                     "conditions": [{
@@ -260,27 +232,27 @@ def process_cert_request(body, channel=None):
                         "message": "Failed to issue certificate",
                         "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
-                })
+                }, logger)
             return False
     except Exception as e:
         logger.error(f"Failed to process cert request message: {e}")
         # Update CRD status to Error if we have CRD information
         try:
-            if 'data' in locals() and isinstance(data, dict):
-                crd_name = data.get("crd_name")
-                crd_namespace = data.get("crd_namespace", "default")
-                if crd_name:
-                    update_crd_status(crd_namespace, crd_name, {
-                        "state": "Error",
+            # Use crd_name and crd_namespace captured at the beginning of the try block
+            if crd_name:
+                update_crd_status( # Call imported function
+                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                    crd_namespace, crd_name, {
+                    "state": "Error",
+                    "message": f"Error processing certificate request: {str(e)}",
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "ProcessingError",
                         "message": f"Error processing certificate request: {str(e)}",
-                        "conditions": [{
-                            "type": "Ready",
-                            "status": "False",
-                            "reason": "ProcessingError",
-                            "message": f"Error processing certificate request: {str(e)}",
-                            "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                        }]
-                    })
+                        "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    }]
+                }, logger)
         except Exception as update_error:
             logger.error(f"Failed to update CRD status after error: {update_error}")
         return False
@@ -290,6 +262,7 @@ def process_deployment_event(body, channel): # Added channel parameter
     domain = None
     crd_name = None
     crd_namespace = "default"
+    instance_ip = None # Variable for instance IP
     deployment_successful = False # Flag to track success
 
     try:
@@ -298,6 +271,7 @@ def process_deployment_event(body, channel): # Added channel parameter
         status = data.get("status")
         crd_name = data.get("crd_name")
         crd_namespace = data.get("crd_namespace", "default")
+        instance_ip = data.get("instanceIp") # Get instance IP from message
 
         if not domain or status != "success":
             logger.error(f"Invalid success event data: {data}")
@@ -311,29 +285,74 @@ def process_deployment_event(body, channel): # Added channel parameter
             logger.info(f"Published invalid event for domain {domain or 'Unknown'} to DLQ")
             return False # Indicate failure
 
-        logger.info(f"Processing success event for domain: {domain}")
+        if not instance_ip:
+            logger.error(f"Missing 'instanceIp' in deployment event for domain {domain}. Cannot proceed with SSH deployment.")
+            # Publish to DLQ because we can't connect
+            channel.basic_publish(
+                exchange='',
+                routing_key=QUEUE_NAME_DEPLOYMENT_DLQ,
+                body=body,
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            logger.info(f"Published failed deployment event for {domain} to DLQ due to missing instanceIp")
+            # Update CRD status if possible
+            if crd_name:
+                 update_crd_status( # Call imported function
+                     k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                     crd_namespace, crd_name, {
+                     "state": "Error",
+                     "message": "Deployment failed: Missing instance IP address in deployment event."
+                 }, logger)
+            return False # Indicate failure
+
+        logger.info(f"Processing success event for domain: {domain}, deploying to instance: {instance_ip}")
 
         # Update CRD status to Deploying if available
         if crd_name:
-            update_crd_status(crd_namespace, crd_name, {
+            update_crd_status( # Call imported function
+                k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                crd_namespace, crd_name, {
                 "state": "Deploying",
-                "message": "Certificate is being deployed to NGINX servers"
-            })
+                "message": f"Certificate is being deployed to NGINX server at {instance_ip}"
+            }, logger)
 
         # Initialize SSH connection to deploy certificate
         ssh = SSHAgent()
         try:
+            target_key_filename = os.getenv("TARGET_KEY_FILENAME", SSH_KEY_PATH) # Use SSH_KEY_PATH as default if not set
+            target_port_str = os.getenv("TARGET_PORT", "22")
+            jump_hostname = os.getenv("JUMP_HOSTNAME")
+            jump_username = os.getenv("JUMP_USERNAME")
+            jump_key_filename = os.getenv("JUMP_KEY_FILENAME") # Optional: Key for jump host itself
+            jump_passphrase = os.getenv("JUMP_PASSPHRASE") # Optional: Passphrase for jump host key or target key if on jump host
+            jump_port_str = os.getenv("JUMP_PORT", "22")
+            target_key_on_jump_host_str = os.getenv("TARGET_KEY_ON_JUMP_HOST", "False").lower()
+            target_key_on_jump_host = target_key_on_jump_host_str == 'true'
 
-            # Connect to remote server
+            try:
+                target_port = int(target_port_str)
+                jump_port = int(jump_port_str)
+            except ValueError:
+                print("Error: TARGET_PORT or JUMP_PORT environment variable is not a valid integer.")
+                exit(1)
+
+            # Connect to remote server using instance_ip
+            logger.info(f"Attempting SSH connection to {instance_ip}:{SSH_PORT} as user {SSH_USER}")
             connection = ssh.connect(
-                hostname=SSH_HOST,
+                hostname=instance_ip, # Use instance_ip here
                 port=SSH_PORT,
                 username=SSH_USER,
-                key_filename=SSH_KEY_PATH
+                key_filename=target_key_filename, # Path to target key (potentially on jump host)
+                jump_hostname=jump_hostname,
+                jump_port=jump_port,
+                jump_username=jump_username,
+                jump_key_filename=jump_key_filename, # Key for jump host authentication
+                jump_passphrase=jump_passphrase, # Passphrase for jump host key (or target key if on jump host and encrypted)
+                target_key_on_jump_host=target_key_on_jump_host
             )
 
             if not connection:
-                logger.error(f"Failed to connect to SSH server {SSH_HOST}")
+                logger.error(f"Failed to connect to SSH server {instance_ip}")
                 # Publish to DLQ on SSH connection failure
                 channel.basic_publish(
                     exchange='',
@@ -341,7 +360,15 @@ def process_deployment_event(body, channel): # Added channel parameter
                     body=body,
                     properties=pika.BasicProperties(delivery_mode=2)
                 )
-                logger.info(f"Published failed deployment event for {domain} to DLQ due to SSH connection error")
+                logger.info(f"Published failed deployment event for {domain} to DLQ due to SSH connection error to {instance_ip}")
+                # Update CRD status if possible
+                if crd_name:
+                    update_crd_status( # Call imported function
+                        k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                        crd_namespace, crd_name, {
+                        "state": "Error",
+                        "message": f"Deployment failed: Could not connect to SSH server {instance_ip}"
+                    }, logger)
                 return False # Indicate failure
 
             # Create certificate directory if it doesn't exist
@@ -350,8 +377,9 @@ def process_deployment_event(body, channel): # Added channel parameter
             exit_code, stdout, stderr = ssh.execute_command(command)
 
             if exit_code != 0:
-                logger.error(f"Failed to create directory {target_dir}: {stderr}")
-                return False
+                logger.error(f"Failed to create directory {target_dir} on {instance_ip}: {stderr}")
+                # Consider publishing to DLQ and updating status here as well
+                return False # Indicate failure
 
             # Upload the certificate files
             # Fullchain certificate
@@ -360,20 +388,22 @@ def process_deployment_event(body, channel): # Added channel parameter
             final_remote_path = f"{target_dir}/fullchain.pem"
 
             if not ssh.upload_from_s3_to_remote(s3_cert_path, temp_remote_path):
-                logger.error("Certificate upload failed")
+                logger.error(f"Certificate upload failed for {domain} to {instance_ip}")
+                # Consider publishing to DLQ and updating status
                 return False
 
-            logger.info(f"Certificate uploaded to temporary location {temp_remote_path}")
+            logger.info(f"Certificate uploaded to temporary location {temp_remote_path} on {instance_ip}")
 
             # Move the certificate file to the final destination with sudo and set permissions
             move_command = f"sudo cp {temp_remote_path} {final_remote_path} && sudo chmod 644 {final_remote_path} && rm {temp_remote_path}"
             exit_code, stdout, stderr = ssh.execute_command(move_command)
 
             if exit_code != 0:
-                logger.error(f"Failed to move certificate to final destination: {stderr}")
+                logger.error(f"Failed to move certificate to final destination on {instance_ip}: {stderr}")
+                # Consider publishing to DLQ and updating status
                 return False
 
-            logger.info(f"Certificate successfully deployed to {final_remote_path}")
+            logger.info(f"Certificate successfully deployed to {final_remote_path} on {instance_ip}")
 
             # Process the private key file
             s3_key_path = f"s3://{S3_CERT_BUCKET}/certs/{domain}/{domain}.key"
@@ -381,38 +411,43 @@ def process_deployment_event(body, channel): # Added channel parameter
             final_key_path = f"{target_dir}/privkey.pem"
 
             if not ssh.upload_from_s3_to_remote(s3_key_path, temp_key_path):
-                logger.error("Private key upload failed")
+                logger.error(f"Private key upload failed for {domain} to {instance_ip}")
+                # Consider publishing to DLQ and updating status
                 return False
 
-            logger.info(f"Private key uploaded to temporary location {temp_key_path}")
+            logger.info(f"Private key uploaded to temporary location {temp_key_path} on {instance_ip}")
 
             # Move the key file to the final destination with sudo and set more restrictive permissions
             move_key_command = f"sudo cp {temp_key_path} {final_key_path} && sudo chmod 600 {final_key_path} && rm {temp_key_path}"
             exit_code, stdout, stderr = ssh.execute_command(move_key_command)
 
             if exit_code != 0:
-                logger.error(f"Failed to move private key to final destination: {stderr}")
+                logger.error(f"Failed to move private key to final destination on {instance_ip}: {stderr}")
+                # Consider publishing to DLQ and updating status
                 return False
 
-            logger.info(f"Private key successfully deployed to {final_key_path}")
+            logger.info(f"Private key successfully deployed to {final_key_path} on {instance_ip}")
 
             # Reload Nginx or other web server if needed
             reload_command = "sudo systemctl reload nginx"
             exit_code, stdout, stderr = ssh.execute_command(reload_command)
             if exit_code != 0:
-                logger.warning(f"Failed to reload nginx: {stderr}")
+                logger.warning(f"Failed to reload nginx on {instance_ip}: {stderr}")
                 # Decide if this is critical. For now, let's consider deployment successful even if reload fails.
             else:
-                logger.info("Nginx reloaded successfully")
+                logger.info(f"Nginx reloaded successfully on {instance_ip}")
 
-            logger.info(f"Success event for {domain} processed completely")
+
+            logger.info(f"Success event for {domain} processed completely for instance {instance_ip}")
             deployment_successful = True # Mark deployment as successful
 
             # Update CRD status to Deployed
             if crd_name:
-                update_crd_status(crd_namespace, crd_name, {
+                update_crd_status( # Call imported function
+                    k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                    crd_namespace, crd_name, {
                     "state": "Deployed",
-                    "message": "Certificate successfully deployed to NGINX servers",
+                    "message": f"Certificate successfully deployed to NGINX server at {instance_ip}",
                     "conditions": [{
                         "type": "Ready",
                         "status": "True",
@@ -420,20 +455,20 @@ def process_deployment_event(body, channel): # Added channel parameter
                         "message": "Certificate successfully deployed to NGINX servers",
                         "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
-                })
+                }, logger)
 
             # Publish to success queue
             channel.basic_publish(
                 exchange='',
                 routing_key=QUEUE_NAME_DEPLOYMENT_SUCCESS,
-                body=body,
+                body=body, # Forward the original message body
                 properties=pika.BasicProperties(delivery_mode=2)
             )
             logger.info(f"Published successful deployment event for {domain} to {QUEUE_NAME_DEPLOYMENT_SUCCESS}")
             return True # Indicate success
 
         except Exception as ssh_error: # Catch specific SSH/deployment errors
-             logger.error(f"Error during SSH deployment for {domain}: {ssh_error}")
+             logger.error(f"Error during SSH deployment for {domain} to {instance_ip}: {ssh_error}")
              # Publish to DLQ on specific deployment errors
              channel.basic_publish(
                  exchange='',
@@ -441,23 +476,23 @@ def process_deployment_event(body, channel): # Added channel parameter
                  body=body,
                  properties=pika.BasicProperties(delivery_mode=2)
              )
-             logger.info(f"Published failed deployment event for {domain} to DLQ due to deployment error: {ssh_error}")
+             logger.info(f"Published failed deployment event for {domain} to DLQ due to deployment error on {instance_ip}: {ssh_error}")
              # Update CRD status to Error if possible
              if crd_name:
-                 update_crd_status(crd_namespace, crd_name, {
+                 update_crd_status( # Call imported function
+                     k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                     crd_namespace, crd_name, {
                      "state": "Error",
-                     "message": f"Deployment failed: {str(ssh_error)}"
-                 })
+                     "message": f"Deployment failed on {instance_ip}: {str(ssh_error)}",
+                     "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                 }, logger)
              return False # Indicate failure
         finally:
             # Ensure SSH connection is closed
             ssh.disconnect()
             # If deployment failed before reaching the success publish step, publish to DLQ here
             if not deployment_successful:
-                 # Check if it wasn't already published due to an earlier error
-                 # (This check might be complex, simpler to potentially double-publish to DLQ than miss it)
-                 # For simplicity, we rely on the specific error handling above to publish to DLQ.
-                 # If an error occurs before the success publish, it should have been caught.
+                 # Rely on specific error handling above to publish to DLQ.
                  pass
 
 
@@ -473,10 +508,13 @@ def process_deployment_event(body, channel): # Added channel parameter
         logger.info(f"Published failed deployment event for {domain or 'Unknown'} to DLQ due to processing error: {e}")
         # Update CRD status to Error if possible
         if crd_name and domain: # Check if we have enough info
-             update_crd_status(crd_namespace, crd_name, {
+             update_crd_status( # Call imported function
+                 k8s_custom_objects_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                 crd_namespace, crd_name, {
                  "state": "Error",
-                 "message": f"Error processing deployment event: {str(e)}"
-             })
+                 "message": f"Error processing deployment event: {str(e)}",
+                 "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+             }, logger)
         return False # Indicate failure
 
 def main():
@@ -497,8 +535,8 @@ def main():
     channel.queue_declare(queue=QUEUE_NAME_DEPLOYMENT_SUCCESS, durable=True) # Declare success queue
     channel.queue_declare(queue=QUEUE_NAME_DEPLOYMENT_DLQ, durable=True)     # Declare DLQ queue
     
-    # Set up the delay mechanism for requests
-    retry_exchange, delay_queue = setup_delay_queue(channel, QUEUE_NAME_REQUESTS)
+    # Set up the delay mechanism for requests using the imported function
+    retry_exchange, delay_queue = setup_delay_queue(channel, QUEUE_NAME_REQUESTS, RETRY_DELAY_MS, logger)
     
     # Define callback for certificate requests
     def request_callback(ch, method, properties, body):

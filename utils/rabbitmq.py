@@ -55,3 +55,38 @@ def send_rabbitmq_message(
     except Exception as e:
         logger.error(f"Failed to send message to RabbitMQ: {e}")
         return False
+
+def setup_delay_queue(channel, queue_name, retry_delay_ms, logger: logging.Logger):
+    """
+    Set up the queues and exchanges needed for delayed message processing
+    """
+    # Create the retry exchange
+    retry_exchange_name = f"{queue_name}_retry_exchange"
+    channel.exchange_declare(
+        exchange=retry_exchange_name,
+        exchange_type='direct',
+        durable=True
+    )
+
+    # Create the delay queue with the specified TTL (time-to-live)
+    delay_queue_name = f"{queue_name}_delay_queue"
+    arguments = {
+        'x-dead-letter-exchange': '',  # Default exchange
+        'x-dead-letter-routing-key': queue_name,  # Route back to the original queue
+        'x-message-ttl': retry_delay_ms,  # Delay time in milliseconds
+    }
+    channel.queue_declare(
+        queue=delay_queue_name,
+        durable=True,
+        arguments=arguments
+    )
+
+    # Bind the delay queue to the retry exchange
+    channel.queue_bind(
+        queue=delay_queue_name,
+        exchange=retry_exchange_name,
+        routing_key=delay_queue_name
+    )
+
+    logger.info(f"Configured delay queue: {delay_queue_name} with TTL: {retry_delay_ms}ms")
+    return retry_exchange_name, delay_queue_name
