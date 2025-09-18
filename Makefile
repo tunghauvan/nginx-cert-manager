@@ -1,7 +1,7 @@
 # Makefile for nginx-cert-manager agent and worker
 
 # Variables
-REGISTRY ?= registry.asean-accesstrade.net
+REGISTRY ?= docker.asean-accesstrade.net
 NAMESPACE ?= nginx-cert-manager
 VERSION ?= latest
 

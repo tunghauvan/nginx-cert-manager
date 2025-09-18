@@ -39,7 +39,7 @@ spec:
       containers:
         - name: worker
           # Replace with the actual image name and tag you built
-          image: registry.asean-accesstrade.net/library/nginx-cert-manager-worker:latest
+          image: docker.asean-accesstrade.net/library/nginx-cert-manager-worker:latest
           imagePullPolicy: Always # Or Always, depending on your image tagging strategy
           ports:
             # Port the container listens on (should match targetPort in the Service)

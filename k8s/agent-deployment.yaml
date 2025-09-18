@@ -40,7 +40,7 @@ spec:
       containers:
         - name: agent
           # Replace with the actual image name and tag you built
-          image: registry.asean-accesstrade.net/library/nginx-cert-manager:latest
+          image: docker.asean-accesstrade.net/library/nginx-cert-manager:latest
           imagePullPolicy: Always # Or Always, depending on your image tagging strategy
           # Change command to sleep if you want to keep the container running without doing anything
           # command: ["/bin/sh", "-c", "sleep 3600"]
