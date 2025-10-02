@@ -45,7 +45,8 @@ ACME_DIRECTORY_URL = "https://acme-v02.api.letsencrypt.org/directory"
 RETRY_DELAY_MS = 60000  # 60 seconds in milliseconds
 MAX_RETRY_COUNT = 3  # Maximum number of retries
 RENEWAL_CHECK_INTERVAL_SECONDS = 60 * 60 * 24 # Check once a day
-RENEWAL_THRESHOLD_DAYS = 30 # Renew if expiring within 30 days
+RENEWAL_THRESHOLD_DAYS = 7 # Renew if expiring within 7 days
+STUCK_STATE_TIMEOUT_SECONDS = 3600 # Reset stuck states after 1 hour (3600 seconds)
 
 # SSH and S3 configuration for deployment
 # SSH_HOST = os.environ.get("SSH_HOST", "172.31.35.222") # No longer primary source for host
@@ -1007,6 +1008,50 @@ def check_and_trigger_renewals(channel, k8s_co_api, k8s_core_api, stop_event): #
                         if not not_after_str:
                             logger.info(f"Skipping CR {namespace_name}/{name} for domain {domain}: status.notAfter is not set.")
                             continue
+
+                        # Check for certificates stuck in transitional states
+                        if current_state in ["Processing", "Renewing", "Deploying"]:
+                            # Check if the certificate has been stuck too long
+                            last_transition_time = None
+                            if 'conditions' in status:
+                                for condition in status['conditions']:
+                                    if condition.get('type') == 'Ready':
+                                        last_transition_time = condition.get('lastTransitionTime')
+                                        break
+
+                            if last_transition_time:
+                                try:
+                                    # Parse the last transition time
+                                    transition_dt = datetime.strptime(last_transition_time, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+                                    stuck_duration = now - transition_dt
+
+                                    # If stuck for more than the timeout, reset to Deployed state
+                                    if stuck_duration.total_seconds() > STUCK_STATE_TIMEOUT_SECONDS:
+                                        logger.warning(f"Certificate {namespace_name}/{name} has been in '{current_state}' state for {stuck_duration} (>{STUCK_STATE_TIMEOUT_SECONDS}s). Resetting to 'Deployed'.")
+                                        update_crd_status(
+                                            k8s_co_api, CRD_GROUP, CRD_VERSION, CRD_PLURAL,
+                                            namespace_name, name, {
+                                            "state": "Deployed",
+                                            "message": f"Reset from stuck '{current_state}' state after {int(stuck_duration.total_seconds())}s timeout",
+                                            "conditions": [{
+                                                "type": "Ready",
+                                                "status": "True",
+                                                "reason": "StateReset",
+                                                "message": f"Automatically reset from stuck '{current_state}' state",
+                                                "lastTransitionTime": now.strftime('%Y-%m-%dT%H:%M:%SZ')
+                                            }]
+                                        }, logger)
+                                        # After reset, continue with normal processing
+                                        current_state = "Deployed"
+                                    else:
+                                        logger.info(f"Skipping CR {namespace_name}/{name} for domain {domain}: current state is '{current_state}' (stuck for {stuck_duration}).")
+                                        continue
+                                except (ValueError, TypeError) as e:
+                                    logger.warning(f"Could not parse lastTransitionTime '{last_transition_time}' for {namespace_name}/{name}: {e}. Skipping.")
+                                    continue
+                            else:
+                                logger.info(f"Skipping CR {namespace_name}/{name} for domain {domain}: current state is '{current_state}' (no transition time).")
+                                continue
 
                         # States that indicate an operation is already in progress
                         if current_state in ["Processing", "Renewing", "Deploying"]:
