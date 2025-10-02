@@ -4,10 +4,13 @@ import logging
 import pika
 import time
 import threading
+import base64
 from datetime import datetime, timezone, timedelta # Added timedelta
 from dotenv import load_dotenv
 import boto3
 import tempfile
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 from utils.sshagent import SSHAgent
 from utils.certbot import request_certificate
 from utils.s3 import upload_cert_to_s3
@@ -75,6 +78,256 @@ try:
 except Exception as e:
     logger.warning(f"Failed to initialize Kubernetes clients: {e}")
     logger.warning("CRD status updates and renewal checks might be disabled or limited.")
+
+def parse_certificate_expiry_from_s3(domain, s3_bucket=None):
+    """
+    Parse certificate from S3 and extract expiry information.
+    
+    Args:
+        domain (str): The domain name for the certificate
+        s3_bucket (str): Optional - S3 bucket name (defaults to env var)
+        
+    Returns:
+        dict: Certificate details (notBefore, notAfter, serialNumber) or None if failed
+    """
+    try:
+        s3_bucket = s3_bucket or os.environ.get("S3_CERT_BUCKET", "accesstrade-server-configs")
+        s3_client = boto3.client('s3')
+        
+        # Download certificate
+        cert_key = f"certs/{domain}/{domain}.crt"
+        cert_response = s3_client.get_object(Bucket=s3_bucket, Key=cert_key)
+        cert_data = cert_response['Body'].read()
+        
+        # Parse the certificate
+        cert = x509.load_pem_x509_certificate(cert_data, default_backend())
+        
+        # Extract certificate details
+        not_before = cert.not_valid_before_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        not_after = cert.not_valid_after_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        serial_number = str(cert.serial_number)
+        
+        logger.debug(f"Certificate for {domain}: notBefore={not_before}, notAfter={not_after}, serial={serial_number}")
+        
+        return {
+            'notBefore': not_before,
+            'notAfter': not_after,
+            'serialNumber': serial_number
+        }
+    except Exception as e:
+        logger.error(f"Failed to parse certificate for {domain}: {e}")
+        return None
+
+def migrate_certificate_expiry_dates():
+    """
+    Migration function to fix incorrect expiry dates on startup.
+    Reads actual expiry dates from S3 certificates and updates CRD status.
+    """
+    if not k8s_custom_objects_api or not k8s_core_v1_api:
+        logger.warning("Kubernetes clients not available, skipping certificate expiry migration")
+        return
+    
+    logger.info("=" * 80)
+    logger.info("Starting certificate expiry date migration on startup")
+    logger.info("=" * 80)
+    
+    success_count = 0
+    failure_count = 0
+    skipped_count = 0
+    
+    try:
+        # List all namespaces
+        namespaces = k8s_core_v1_api.list_namespace()
+        logger.info(f"Found {len(namespaces.items)} namespaces to check")
+        
+        for ns in namespaces.items:
+            namespace_name = ns.metadata.name
+            
+            try:
+                # List all DomainCertificates in this namespace
+                cr_list = k8s_custom_objects_api.list_namespaced_custom_object(
+                    group=CRD_GROUP,
+                    version=CRD_VERSION,
+                    plural=CRD_PLURAL,
+                    namespace=namespace_name
+                )
+                
+                crs = cr_list.get('items', [])
+                if not crs:
+                    continue
+                
+                logger.info(f"Checking {len(crs)} DomainCertificates in namespace {namespace_name}")
+                
+                for cr in crs:
+                    metadata = cr.get('metadata', {})
+                    spec = cr.get('spec', {})
+                    status = cr.get('status', {})
+                    
+                    name = metadata.get('name')
+                    domain = spec.get('domain')
+                    current_state = status.get('state')
+                    current_not_after = status.get('notAfter')
+                    
+                    if not domain:
+                        logger.debug(f"Skipping {namespace_name}/{name}: no domain in spec")
+                        skipped_count += 1
+                        continue
+                    
+                    # Only migrate if certificate is in Issued or Deployed state
+                    if current_state not in ['Issued', 'Deployed']:
+                        logger.debug(f"Skipping {namespace_name}/{name}: state is {current_state}")
+                        skipped_count += 1
+                        continue
+                    
+                    # Get actual certificate details from S3
+                    cert_details = parse_certificate_expiry_from_s3(domain)
+                    
+                    if not cert_details:
+                        logger.warning(f"Skipping {namespace_name}/{name}: could not parse certificate from S3")
+                        skipped_count += 1
+                        continue
+                    
+                    # Check if update is needed
+                    if current_not_after == cert_details['notAfter']:
+                        logger.debug(f"Skipping {namespace_name}/{name}: expiry date already correct")
+                        skipped_count += 1
+                        continue
+                    
+                    logger.info(f"Updating {namespace_name}/{name}: {current_not_after} -> {cert_details['notAfter']}")
+                    
+                    # Update CRD status with correct expiry dates
+                    try:
+                        # Update the status fields
+                        status.update({
+                            'notBefore': cert_details['notBefore'],
+                            'notAfter': cert_details['notAfter'],
+                            'serialNumber': cert_details['serialNumber']
+                        })
+                        
+                        # Patch the status
+                        k8s_custom_objects_api.patch_namespaced_custom_object_status(
+                            group=CRD_GROUP,
+                            version=CRD_VERSION,
+                            namespace=namespace_name,
+                            plural=CRD_PLURAL,
+                            name=name,
+                            body={'status': status}
+                        )
+                        
+                        logger.info(f"Successfully updated {namespace_name}/{name}")
+                        success_count += 1
+                        
+                    except ApiException as e:
+                        logger.error(f"Failed to update {namespace_name}/{name}: {e.status} - {e.reason}")
+                        failure_count += 1
+                    except Exception as e:
+                        logger.error(f"Unexpected error updating {namespace_name}/{name}: {e}")
+                        failure_count += 1
+                
+            except ApiException as e:
+                logger.error(f"Error listing DomainCertificates in namespace {namespace_name}: {e.status} - {e.reason}")
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error processing namespace {namespace_name}: {e}")
+                continue
+        
+    except ApiException as e:
+        logger.error(f"Error listing namespaces: {e.status} - {e.reason}")
+    except Exception as e:
+        logger.error(f"Unexpected error during migration: {e}")
+    
+    logger.info("=" * 80)
+    logger.info("Certificate expiry date migration summary:")
+    logger.info(f"  Successfully updated: {success_count}")
+    logger.info(f"  Failed: {failure_count}")
+    logger.info(f"  Skipped: {skipped_count}")
+    logger.info("=" * 80)
+
+def download_cert_from_s3(domain, s3_bucket=None):
+    """
+    Download certificate and key data from S3
+    
+    Args:
+        domain (str): The domain name for the certificate
+        s3_bucket (str): Optional - S3 bucket name (defaults to env var)
+        
+    Returns:
+        tuple: (cert_data, key_data) or (None, None) if failed
+    """
+    try:
+        s3_bucket = s3_bucket or os.environ.get("S3_CERT_BUCKET", "accesstrade-server-configs")
+        s3_client = boto3.client('s3')
+        
+        # Download certificate
+        cert_key = f"certs/{domain}/{domain}.crt"
+        cert_response = s3_client.get_object(Bucket=s3_bucket, Key=cert_key)
+        cert_data = cert_response['Body'].read().decode('utf-8')
+        
+        # Download private key
+        key_key = f"certs/{domain}/{domain}.key"
+        key_response = s3_client.get_object(Bucket=s3_bucket, Key=key_key)
+        key_data = key_response['Body'].read().decode('utf-8')
+        
+        logger.info(f"Successfully downloaded certificate data for {domain} from S3")
+        return cert_data, key_data
+    except Exception as e:
+        logger.error(f"Failed to download certificate data from S3: {e}")
+        return None, None
+
+def create_k8s_tls_secret(domain, cert_data, key_data, namespace="default"):
+    """
+    Create a Kubernetes TLS secret containing the certificate data
+    
+    Args:
+        domain (str): The domain name for the certificate
+        cert_data (str): PEM-encoded certificate data
+        key_data (str): PEM-encoded private key data
+        namespace (str): Kubernetes namespace
+        
+    Returns:
+        bool: True if secret created successfully, False otherwise
+    """
+    if not k8s_core_v1_api:
+        logger.warning("Kubernetes CoreV1Api client not available, cannot create TLS secret")
+        return False
+    
+    try:
+        # Create the secret name (sanitize domain name for Kubernetes)
+        secret_name = f"tls-{domain.replace('.', '-')}"
+        
+        # Create the secret object
+        secret = client.V1Secret(
+            api_version="v1",
+            kind="Secret",
+            metadata=client.V1ObjectMeta(
+                name=secret_name,
+                namespace=namespace
+            ),
+            type="kubernetes.io/tls",
+            data={
+                "tls.crt": base64.b64encode(cert_data.encode('utf-8')).decode('utf-8'),
+                "tls.key": base64.b64encode(key_data.encode('utf-8')).decode('utf-8')
+            }
+        )
+        
+        # Try to create the secret
+        try:
+            k8s_core_v1_api.create_namespaced_secret(namespace, secret)
+            logger.info(f"Successfully created Kubernetes TLS secret '{secret_name}' in namespace '{namespace}'")
+            return True
+        except ApiException as e:
+            if e.status == 409:  # Conflict - secret already exists
+                # Update the existing secret
+                k8s_core_v1_api.replace_namespaced_secret(secret_name, namespace, secret)
+                logger.info(f"Successfully updated existing Kubernetes TLS secret '{secret_name}' in namespace '{namespace}'")
+                return True
+            else:
+                logger.error(f"Failed to create/update Kubernetes TLS secret: {e}")
+                return False
+                
+    except Exception as e:
+        logger.error(f"Failed to create Kubernetes TLS secret: {e}")
+        return False
 
 def process_cert_request(body, channel=None):
     instance_ip = None # Variable to store instance IP
@@ -176,9 +429,7 @@ def process_cert_request(body, channel=None):
             now = datetime.now(timezone.utc)
             not_before = now.strftime('%Y-%m-%dT%H:%M:%SZ')
             # Set expiry to 90 days (typical for Let's Encrypt)
-            not_after = datetime(now.year + (1 if now.month <= 9 else 0), 
-                                 ((now.month + 3 - 1) % 12) + 1, 
-                                 min(now.day, 28)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            not_after = (now + timedelta(days=90)).strftime('%Y-%m-%dT%H:%M:%SZ')
             serial_number = f"mock-{int(time.time())}"  # Real implementation would get actual serial number
             
             # Update CRD status to Issued with certificate details
@@ -199,6 +450,16 @@ def process_cert_request(body, channel=None):
                         "lastTransitionTime": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                     }]
                 }, logger)
+
+            # Create Kubernetes TLS secret
+            cert_data, key_data = download_cert_from_s3(domain)
+            if cert_data and key_data:
+                if create_k8s_tls_secret(domain, cert_data, key_data, crd_namespace):
+                    logger.info(f"Successfully created/updated Kubernetes TLS secret for {domain}")
+                else:
+                    logger.warning(f"Failed to create Kubernetes TLS secret for {domain}")
+            else:
+                logger.warning(f"Could not download certificate data from S3 for {domain}, skipping TLS secret creation")
 
             # Publish success event to RabbitMQ with CRD information AND instanceIp
             if channel:
@@ -850,6 +1111,15 @@ def check_and_trigger_renewals(channel, k8s_co_api, k8s_core_api, stop_event): #
 
 def main():
     """Main function to handle both certificate requests and success events."""
+    
+    # Run certificate expiry date migration on startup
+    logger.info("Running startup migration to fix certificate expiry dates...")
+    try:
+        migrate_certificate_expiry_dates()
+    except Exception as e:
+        logger.error(f"Error during startup migration: {e}")
+        logger.warning("Continuing with worker startup despite migration error")
+    
     # Connect to RabbitMQ
     credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
     parameters = pika.ConnectionParameters(

@@ -70,12 +70,12 @@ else:
             config.load_kube_config()
             logger.info("Loaded local Kubernetes config.")
             # Print cluster info for debugging
-            cluster_info = config.list_kube_config_contexts()
-            if cluster_info:
-                current_context = cluster_info[0]['name']
+            contexts, current = config.list_kube_config_contexts()
+            if current:
+                current_context = current['name']
                 logger.info(f"Current context: {current_context}") # Changed from print
             else:
-                logger.warning("No Kubernetes contexts found.") # Changed from print
+                logger.warning("No current Kubernetes context found.") # Changed from print
             k8s_custom_objects_api = client.CustomObjectsApi()
         except config.ConfigException:
             logger.error("Could not configure Kubernetes client (in-cluster or local). Status updates will fail.") # Changed from print
